@@ -1,3 +1,4 @@
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use crate::config::Language;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,10 +178,6 @@ mod native {
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 impl NativeMenu {
-    pub fn new(_cc: &eframe::CreationContext<'_>, _language: Language) -> Result<Self, String> {
-        Err("native menu is not supported on this platform".to_owned())
-    }
-
     pub fn poll_commands(&self) -> Vec<MenuCommand> {
         Vec::new()
     }
