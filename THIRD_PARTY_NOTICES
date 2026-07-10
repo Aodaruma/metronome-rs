@@ -1,0 +1,29 @@
+metronome-rs third-party notices
+================================
+
+This application is built with open-source Rust crates. The exact resolved
+versions are recorded in Cargo.lock. License metadata and source distributions
+for every transitive dependency are available from crates.io.
+
+Principal direct dependencies include:
+
+- eframe / egui: MIT OR Apache-2.0
+- cpal: Apache-2.0
+- rtrb: MIT OR Apache-2.0
+- symphonia: MPL-2.0
+- rfd: MIT
+- serde / serde_json: MIT OR Apache-2.0
+- thiserror: MIT OR Apache-2.0
+- hound: Apache-2.0
+- directories: MIT OR Apache-2.0
+- muda, tray-icon, and global-hotkey: MIT OR Apache-2.0
+- auto-launch: MIT
+- sys-locale: MIT OR Apache-2.0
+
+The application loads Japanese fonts supplied by the operating system at
+runtime. It does not redistribute those system font files. UI icons are drawn
+procedurally by metronome-rs; no Material Symbols font or SVG file is bundled.
+
+The metronome-rs source itself is distributed under the MIT License. See the
+LICENSE file included beside this notice.
+

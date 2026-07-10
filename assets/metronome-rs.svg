@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="metronome-rs">
+  <circle cx="64" cy="64" r="58" fill="#007aaa"/>
+  <path d="M64 24v62M42 91h44" fill="none" stroke="#f5f8fa" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="64" cy="28" r="8" fill="#f5f8fa"/>
+</svg>
+
