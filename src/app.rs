@@ -6,10 +6,11 @@ use eframe::egui;
 use crate::audio::{AudioDiagnostics, AudioEngine, BeatEvent, validate_audio_file};
 use crate::config::{
     AppConfig, BPM_MAX, BPM_MIN, BPM_SOFT_MAX, BpmPreset, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS,
-    Language, LanguageMode, MeterMode, ThemeMode, load_config, save_config,
+    CloseBehavior, Language, LanguageMode, MeterMode, ThemeMode, load_config, save_config,
 };
 use crate::fonts::install_japanese_font;
 use crate::menu::{MenuCommand, NativeMenu};
+use crate::platform::{PlatformCommand, PlatformRuntime, set_auto_launch, validate_shortcut};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTab {
@@ -25,19 +26,28 @@ pub struct MetronomeApp {
     save_error: Option<String>,
     native_menu: Option<NativeMenu>,
     native_menu_error: Option<String>,
+    platform: PlatformRuntime,
+    platform_error: Option<String>,
     tab: AppTab,
     last_beat: Option<BeatEvent>,
     last_beat_time: f64,
     last_accent_time: f64,
     preset_name_draft: String,
+    window_visible: bool,
+    force_exit: bool,
 }
 
 impl MetronomeApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, requested_hidden: bool) -> Self {
         let (mut config, config_notice) = load_config();
         config.sanitize();
+        let start_hidden = requested_hidden && config.background.close_behavior.keeps_running();
+        if requested_hidden && !start_hidden {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
         install_japanese_font(&cc.egui_ctx);
-        apply_theme(&cc.egui_ctx, config.theme);
+        apply_appearance(&cc.egui_ctx, config.theme, config.appearance.accent_rgb);
 
         let (audio, audio_error) = match AudioEngine::new(&config) {
             Ok(engine) => (Some(engine), None),
@@ -51,6 +61,7 @@ impl MetronomeApp {
         };
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let (native_menu, native_menu_error) = (None, None);
+        let (platform, platform_error) = PlatformRuntime::new(&config.background);
 
         Self {
             config,
@@ -60,11 +71,15 @@ impl MetronomeApp {
             save_error: None,
             native_menu,
             native_menu_error,
+            platform,
+            platform_error,
             tab: AppTab::Metronome,
             last_beat: None,
             last_beat_time: 0.0,
             last_accent_time: -1.0,
             preset_name_draft: String::new(),
+            window_visible: !start_hidden,
+            force_exit: false,
         }
     }
 
@@ -118,10 +133,46 @@ impl MetronomeApp {
         }
     }
 
+    fn poll_platform_events(&mut self, ctx: &egui::Context) {
+        for command in self.platform.poll_commands() {
+            match command {
+                PlatformCommand::ToggleWindow => self.toggle_window(ctx),
+                PlatformCommand::TogglePlayback => self.toggle_running(),
+                PlatformCommand::Quit => self.quit(ctx),
+            }
+        }
+    }
+
+    fn toggle_window(&mut self, ctx: &egui::Context) {
+        self.window_visible = !self.window_visible;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.window_visible));
+        if self.window_visible {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.force_exit = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested
+            && !self.force_exit
+            && self.config.background.close_behavior.keeps_running()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_visible = false;
+        }
+    }
+
     fn handle_menu_command(&mut self, command: MenuCommand, ctx: &egui::Context) {
         match command {
             MenuCommand::SaveSettings => self.persist_config(),
-            MenuCommand::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            MenuCommand::Quit => self.quit(ctx),
             MenuCommand::TogglePlayback => self.toggle_running(),
             MenuCommand::BpmUp => self.adjust_bpm(1),
             MenuCommand::BpmDown => self.adjust_bpm(-1),
@@ -231,8 +282,25 @@ impl MetronomeApp {
             return;
         }
         self.config.theme = theme;
-        apply_theme(ctx, theme);
+        apply_appearance(ctx, theme, self.config.appearance.accent_rgb);
         self.persist_config();
+    }
+
+    fn set_accent_color(&mut self, ctx: &egui::Context, color: egui::Color32) {
+        let next = [color.r(), color.g(), color.b()];
+        if self.config.appearance.accent_rgb == next {
+            return;
+        }
+        self.config.appearance.accent_rgb = next;
+        apply_appearance(ctx, self.config.theme, next);
+        self.persist_config();
+    }
+
+    fn sync_background_settings(&mut self) {
+        match self.platform.sync(&self.config.background) {
+            Ok(()) => self.platform_error = None,
+            Err(error) => self.platform_error = Some(error),
+        }
     }
 
     fn save_current_preset(&mut self) {
@@ -508,6 +576,12 @@ impl MetronomeApp {
         let mut language = self.config.language;
         let mut theme = self.config.theme;
         let mut meter_mode = self.config.meter_mode;
+        let mut accent_color = egui::Color32::from_rgb(
+            self.config.appearance.accent_rgb[0],
+            self.config.appearance.accent_rgb[1],
+            self.config.appearance.accent_rgb[2],
+        );
+        let mut accent_center_flash = self.config.appearance.accent_center_flash;
         egui::Frame::group(ui.style())
             .corner_radius(8.0)
             .inner_margin(12.0)
@@ -569,10 +643,35 @@ impl MetronomeApp {
                             });
                         ui.end_row();
                     });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr(lang, "アクセントカラー", "Accent color"));
+                    ui.color_edit_button_srgba(&mut accent_color);
+                });
+                ui.checkbox(
+                    &mut accent_center_flash,
+                    tr(
+                        lang,
+                        "アクセント拍で中央をカラー表示",
+                        "Flash the center on accent beats",
+                    ),
+                )
+                .on_hover_text(tr(
+                    lang,
+                    "中央の円がアクセントカラーから徐々に通常色へ戻ります。",
+                    "The center fades from the accent color back to its normal color.",
+                ));
             });
         self.set_language(language);
         self.set_theme(ctx, theme);
         self.set_meter_mode(meter_mode);
+        self.set_accent_color(ctx, accent_color);
+        if self.config.appearance.accent_center_flash != accent_center_flash {
+            self.config.appearance.accent_center_flash = accent_center_flash;
+            self.persist_config();
+        }
 
         let lang = self.language();
         ui.add_space(10.0);
@@ -617,9 +716,134 @@ impl MetronomeApp {
         }
 
         ui.add_space(10.0);
+        self.show_background_preferences(ui, lang);
+
+        ui.add_space(10.0);
         egui::CollapsingHeader::new(tr(lang, "診断", "Diagnostics"))
             .default_open(false)
             .show(ui, |ui| self.show_diagnostics(ui, lang));
+    }
+
+    fn show_background_preferences(&mut self, ui: &mut egui::Ui, lang: Language) {
+        let mut close_behavior = self.config.background.close_behavior;
+        let mut launch_at_startup = self.config.background.launch_at_startup;
+        let mut window_shortcut = self.config.background.toggle_window_shortcut.clone();
+        let mut playback_shortcut = self.config.background.toggle_playback_shortcut.clone();
+        let mut auto_launch_error = None;
+
+        egui::Frame::group(ui.style())
+            .corner_radius(8.0)
+            .inner_margin(12.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(tr(lang, "バックグラウンド", "Background")).strong());
+                ui.add_space(6.0);
+                egui::Grid::new("background_settings_grid")
+                    .num_columns(2)
+                    .spacing([18.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label(tr(lang, "閉じるボタン", "Close button"));
+                        egui::ComboBox::from_id_salt("close_behavior")
+                            .selected_text(close_behavior_label(lang, close_behavior))
+                            .width(200.0)
+                            .show_ui(ui, |ui| {
+                                for value in [CloseBehavior::Exit, CloseBehavior::KeepRunning] {
+                                    ui.selectable_value(
+                                        &mut close_behavior,
+                                        value,
+                                        close_behavior_label(lang, value),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+
+                        ui.label(tr(lang, "PC起動時", "At login"));
+                        ui.add_enabled_ui(close_behavior.keeps_running(), |ui| {
+                            ui.checkbox(
+                                &mut launch_at_startup,
+                                tr(lang, "バックグラウンドで起動", "Start in background"),
+                            );
+                        });
+                        ui.end_row();
+                    });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(tr(lang, "グローバルショートカット", "Global shortcuts"))
+                        .strong(),
+                );
+                ui.label(
+                    egui::RichText::new(tr(
+                        lang,
+                        "例: Ctrl+Alt+M（初期値は空欄）",
+                        "Example: Ctrl+Alt+M (empty by default)",
+                    ))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+                ui.add_enabled_ui(close_behavior.keeps_running(), |ui| {
+                    egui::Grid::new("global_shortcut_grid")
+                        .num_columns(2)
+                        .spacing([18.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(tr(lang, "表示 / 非表示", "Show / hide"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut window_shortcut)
+                                    .hint_text("Ctrl+Alt+M")
+                                    .desired_width(200.0),
+                            );
+                            ui.end_row();
+                            ui.label(tr(lang, "再生 / 停止", "Play / pause"));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut playback_shortcut)
+                                    .hint_text("Ctrl+Alt+P")
+                                    .desired_width(200.0),
+                            );
+                            ui.end_row();
+                        });
+                });
+
+                for value in [&window_shortcut, &playback_shortcut] {
+                    if let Err(error) = validate_shortcut(value) {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                }
+            });
+
+        let behavior_changed = close_behavior != self.config.background.close_behavior;
+        if behavior_changed {
+            self.config.background.close_behavior = close_behavior;
+            if !close_behavior.keeps_running() && launch_at_startup {
+                if let Err(error) = set_auto_launch(false) {
+                    auto_launch_error = Some(error);
+                } else {
+                    launch_at_startup = false;
+                }
+            }
+        }
+
+        if launch_at_startup != self.config.background.launch_at_startup {
+            match set_auto_launch(launch_at_startup) {
+                Ok(()) => self.config.background.launch_at_startup = launch_at_startup,
+                Err(error) => auto_launch_error = Some(error),
+            }
+        }
+
+        let shortcuts_changed = window_shortcut != self.config.background.toggle_window_shortcut
+            || playback_shortcut != self.config.background.toggle_playback_shortcut;
+        if shortcuts_changed {
+            self.config.background.toggle_window_shortcut = window_shortcut;
+            self.config.background.toggle_playback_shortcut = playback_shortcut;
+        }
+        if behavior_changed || shortcuts_changed {
+            self.sync_background_settings();
+            self.persist_config();
+        }
+        if auto_launch_error.is_some() {
+            self.platform_error = auto_launch_error;
+        }
     }
 
     fn show_sound_file_row(&mut self, ui: &mut egui::Ui, lang: Language, accent: bool) {
@@ -718,6 +942,15 @@ impl MetronomeApp {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
                 format!("{}: {error}", tr(lang, "メニュー警告", "Menu warning")),
+            );
+        }
+        if let Some(error) = &self.platform_error {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "{}: {error}",
+                    tr(lang, "OS連携警告", "System integration warning")
+                ),
             );
         }
     }
@@ -946,7 +1179,16 @@ impl MetronomeApp {
         );
 
         let plate_radius = base_radius * 0.61;
-        painter.circle_filled(center, plate_radius, visuals.extreme_bg_color);
+        let plate_fill = central_plate_color(
+            &visuals,
+            active_color,
+            if self.config.appearance.accent_center_flash {
+                accent_pulse
+            } else {
+                0.0
+            },
+        );
+        painter.circle_filled(center, plate_radius, plate_fill);
         painter.circle_stroke(
             center,
             plate_radius,
@@ -960,7 +1202,7 @@ impl MetronomeApp {
             egui::FontId::proportional(14.0),
             visuals.weak_text_color(),
         );
-        self.show_bpm_editor_in_meter(ui, center);
+        self.show_bpm_editor_in_meter(ui, center, plate_radius);
         self.show_time_signature_editor_in_meter(ui, center);
         self.show_meter_toolbar(ui, rect);
         self.show_playback_button_at(ui, center + egui::vec2(0.0, base_radius * 0.92));
@@ -973,7 +1215,7 @@ impl MetronomeApp {
         .inner;
         let painter = ui.painter_at(rect);
         let center = rect.center();
-        let radius = rect.width().min(rect.height()) * 0.36;
+        let radius = rect.width().min(rect.height()) * 0.32;
         let beats = self.config.time_signature.beats_per_bar.max(1);
         let current = self.last_beat.map_or(0, |beat| beat.beat_index);
 
@@ -1006,19 +1248,23 @@ impl MetronomeApp {
         }
 
         let plate_radius = rect.width().min(rect.height()) * 0.40 * 0.61;
-        painter.circle_filled(center, plate_radius, ui.visuals().extreme_bg_color);
+        let accent_color = ui.visuals().selection.bg_fill;
+        let plate_fill = central_plate_color(
+            ui.visuals(),
+            accent_color,
+            if self.config.appearance.accent_center_flash {
+                accent_pulse
+            } else {
+                0.0
+            },
+        );
+        painter.circle_filled(center, plate_radius, plate_fill);
         painter.circle_stroke(
             center,
             plate_radius,
             egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
         );
-        paint_accent_ring(
-            &painter,
-            center,
-            plate_radius,
-            accent_pulse,
-            ui.visuals().selection.bg_fill,
-        );
+        paint_accent_ring(&painter, center, plate_radius, accent_pulse, accent_color);
         painter.text(
             center + egui::vec2(0.0, -54.0),
             egui::Align2::CENTER_CENTER,
@@ -1026,27 +1272,42 @@ impl MetronomeApp {
             egui::FontId::proportional(14.0),
             ui.visuals().weak_text_color(),
         );
-        self.show_bpm_editor_in_meter(ui, center);
+        self.show_bpm_editor_in_meter(ui, center, plate_radius);
         self.show_time_signature_editor_in_meter(ui, center);
         self.show_meter_toolbar(ui, rect);
-        self.show_playback_button_at(ui, center + egui::vec2(0.0, radius + 38.0));
+        self.show_playback_button_at(ui, center + egui::vec2(0.0, radius + 48.0));
     }
 
-    fn show_bpm_editor_in_meter(&mut self, ui: &mut egui::Ui, center: egui::Pos2) {
+    fn show_bpm_editor_in_meter(
+        &mut self,
+        ui: &mut egui::Ui,
+        center: egui::Pos2,
+        plate_radius: f32,
+    ) {
         let mut bpm = self.config.bpm_milli / 1_000;
-        let editor_rect =
-            egui::Rect::from_center_size(center + egui::vec2(0.0, -3.0), egui::vec2(140.0, 44.0));
+        let scale = (plate_radius / 120.0).clamp(0.65, 1.0);
+        let button_size = 38.0 * scale;
+        let button_offset = (plate_radius - button_size * 0.5 - 6.0)
+            .min(91.0 * scale)
+            .max(42.0);
+        let editor_width = (button_offset * 2.0 - button_size - 8.0).max(66.0);
+        let editor_height = 44.0 * scale;
+        let editor_rect = egui::Rect::from_center_size(
+            center + egui::vec2(0.0, -3.0),
+            egui::vec2(editor_width, editor_height),
+        );
         let response = ui
             .scope(|ui| {
-                ui.style_mut()
-                    .text_styles
-                    .insert(egui::TextStyle::Heading, egui::FontId::proportional(40.0));
+                ui.style_mut().text_styles.insert(
+                    egui::TextStyle::Heading,
+                    egui::FontId::proportional(40.0 * scale),
+                );
                 ui.style_mut().drag_value_text_style = egui::TextStyle::Heading;
                 ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
                 ui.style_mut().visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
                 ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
                 ui.spacing_mut().button_padding.y = 0.0;
-                ui.spacing_mut().interact_size.y = 44.0;
+                ui.spacing_mut().interact_size.y = editor_height;
                 ui.put(
                     editor_rect,
                     egui::DragValue::new(&mut bpm)
@@ -1071,8 +1332,10 @@ impl MetronomeApp {
         } else {
             1
         };
-        let minus_rect =
-            egui::Rect::from_center_size(center + egui::vec2(-91.0, -5.0), egui::vec2(38.0, 38.0));
+        let minus_rect = egui::Rect::from_center_size(
+            center + egui::vec2(-button_offset, -5.0),
+            egui::Vec2::splat(button_size),
+        );
         if flat_round_icon_button_at(
             ui,
             minus_rect,
@@ -1084,8 +1347,10 @@ impl MetronomeApp {
         {
             self.adjust_bpm(-step);
         }
-        let plus_rect =
-            egui::Rect::from_center_size(center + egui::vec2(91.0, -5.0), egui::vec2(38.0, 38.0));
+        let plus_rect = egui::Rect::from_center_size(
+            center + egui::vec2(button_offset, -5.0),
+            egui::Vec2::splat(button_size),
+        );
         if flat_round_icon_button_at(
             ui,
             plus_rect,
@@ -1497,10 +1762,19 @@ fn arc_ratio_from_pointer(
 }
 
 impl eframe::App for MetronomeApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_audio_events(ctx);
+        self.poll_menu_events(ctx);
+        self.poll_platform_events(ctx);
+        self.handle_close_request(ctx);
+
+        if self.config.background.close_behavior.keeps_running() {
+            ctx.request_repaint_after(Duration::from_millis(80));
+        }
+    }
+
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
-        self.poll_audio_events(&ctx);
-        self.poll_menu_events(&ctx);
         self.handle_shortcuts(&ctx);
         egui::CentralPanel::default().show(root, |ui| {
             if self.native_menu.is_none() {
@@ -1517,7 +1791,6 @@ impl eframe::App for MetronomeApp {
                         AppTab::Metronome => self.show_metronome(ui, &ctx),
                         AppTab::Preferences => self.show_preferences(ui, &ctx),
                     }
-                    ui.separator();
                     self.show_status(ui);
                 });
         });
@@ -1528,10 +1801,56 @@ impl eframe::App for MetronomeApp {
     }
 }
 
-fn apply_theme(ctx: &egui::Context, theme: ThemeMode) {
-    match theme {
-        ThemeMode::System | ThemeMode::Dark => ctx.set_visuals(egui::Visuals::dark()),
-        ThemeMode::Light => ctx.set_visuals(egui::Visuals::light()),
+fn apply_appearance(ctx: &egui::Context, theme: ThemeMode, accent_rgb: [u8; 3]) {
+    let mut visuals = match theme {
+        ThemeMode::System | ThemeMode::Dark => egui::Visuals::dark(),
+        ThemeMode::Light => {
+            let mut visuals = egui::Visuals::light();
+            visuals.panel_fill = egui::Color32::from_rgb(238, 240, 242);
+            visuals.window_fill = egui::Color32::from_rgb(232, 234, 236);
+            visuals.extreme_bg_color = egui::Color32::from_rgb(190, 195, 200);
+            visuals.faint_bg_color = egui::Color32::from_rgb(216, 220, 224);
+            visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(174, 181, 187);
+            visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(205, 210, 214);
+            visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(190, 196, 201);
+            visuals
+        }
+    };
+    let accent = egui::Color32::from_rgb(accent_rgb[0], accent_rgb[1], accent_rgb[2]);
+    visuals.selection.bg_fill = accent;
+    visuals.selection.stroke.color = readable_on(accent);
+    ctx.set_visuals(visuals);
+}
+
+fn central_plate_color(
+    visuals: &egui::Visuals,
+    accent: egui::Color32,
+    accent_amount: f32,
+) -> egui::Color32 {
+    mix_color(
+        visuals.extreme_bg_color,
+        accent,
+        accent_amount.clamp(0.0, 1.0),
+    )
+}
+
+fn mix_color(from: egui::Color32, to: egui::Color32, amount: f32) -> egui::Color32 {
+    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round() as u8;
+    egui::Color32::from_rgb(
+        mix(from.r(), to.r()),
+        mix(from.g(), to.g()),
+        mix(from.b(), to.b()),
+    )
+}
+
+fn readable_on(color: egui::Color32) -> egui::Color32 {
+    let luminance = 0.2126 * f32::from(color.r())
+        + 0.7152 * f32::from(color.g())
+        + 0.0722 * f32::from(color.b());
+    if luminance > 150.0 {
+        egui::Color32::from_rgb(25, 27, 29)
+    } else {
+        egui::Color32::WHITE
     }
 }
 
@@ -1562,6 +1881,13 @@ fn meter_mode_label(lang: Language, mode: MeterMode) -> &'static str {
     match mode {
         MeterMode::Arc => tr(lang, "円弧", "Arc"),
         MeterMode::Circle => tr(lang, "拍リング", "Beat ring"),
+    }
+}
+
+fn close_behavior_label(lang: Language, behavior: CloseBehavior) -> &'static str {
+    match behavior {
+        CloseBehavior::Exit => tr(lang, "アプリを終了", "Exit the app"),
+        CloseBehavior::KeepRunning => tr(lang, "通知領域で実行を継続", "Keep running in tray"),
     }
 }
 

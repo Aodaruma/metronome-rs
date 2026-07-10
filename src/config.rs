@@ -25,6 +25,8 @@ pub struct AppConfig {
     pub presets: Vec<BpmPreset>,
     pub sound: SoundConfig,
     pub audio: AudioConfig,
+    pub background: BackgroundConfig,
+    pub appearance: AppearanceConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +71,30 @@ pub enum MeterMode {
     Circle,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CloseBehavior {
+    #[default]
+    Exit,
+    KeepRunning,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BackgroundConfig {
+    pub close_behavior: CloseBehavior,
+    pub launch_at_startup: bool,
+    pub toggle_window_shortcut: String,
+    pub toggle_playback_shortcut: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppearanceConfig {
+    pub accent_rgb: [u8; 3],
+    pub accent_center_flash: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
@@ -80,6 +106,32 @@ pub struct AudioConfig {
 pub struct SoundConfig {
     pub normal_path: Option<PathBuf>,
     pub accent_path: Option<PathBuf>,
+}
+
+impl CloseBehavior {
+    pub fn keeps_running(self) -> bool {
+        self == Self::KeepRunning
+    }
+}
+
+impl Default for BackgroundConfig {
+    fn default() -> Self {
+        Self {
+            close_behavior: CloseBehavior::Exit,
+            launch_at_startup: false,
+            toggle_window_shortcut: String::new(),
+            toggle_playback_shortcut: String::new(),
+        }
+    }
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            accent_rgb: [0, 122, 170],
+            accent_center_flash: false,
+        }
+    }
 }
 
 impl Default for AppConfig {
@@ -100,6 +152,8 @@ impl Default for AppConfig {
             audio: AudioConfig {
                 click_timing_offset_ms: 0,
             },
+            background: BackgroundConfig::default(),
+            appearance: AppearanceConfig::default(),
         }
     }
 }
@@ -145,6 +199,10 @@ impl AppConfig {
             .audio
             .click_timing_offset_ms
             .clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS);
+        self.background.toggle_window_shortcut =
+            self.background.toggle_window_shortcut.trim().to_owned();
+        self.background.toggle_playback_shortcut =
+            self.background.toggle_playback_shortcut.trim().to_owned();
     }
 }
 

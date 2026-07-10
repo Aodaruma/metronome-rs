@@ -3,14 +3,17 @@ mod audio;
 mod config;
 mod fonts;
 mod menu;
+mod platform;
 
 use app::MetronomeApp;
 
 fn main() -> eframe::Result {
+    let start_hidden = std::env::args().any(|argument| argument == "--background");
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([520.0, 620.0])
             .with_min_inner_size([420.0, 560.0])
+            .with_visible(!start_hidden)
             .with_resizable(true),
         ..Default::default()
     };
@@ -18,6 +21,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "metronome-rs",
         native_options,
-        Box::new(|cc| Ok(Box::new(MetronomeApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(MetronomeApp::new(cc, start_hidden)))),
     )
 }
