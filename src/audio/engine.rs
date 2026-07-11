@@ -8,7 +8,9 @@ use thiserror::Error;
 
 use crate::audio::sample_bank::{SampleBank, SampleBankError};
 use crate::audio::scheduler::{BeatEvent, BeatScheduler};
-use crate::config::{AppConfig, BPM_MAX, BPM_MIN, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS};
+use crate::config::{
+    AppConfig, BPM_MAX, BPM_MIN, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS, OUTPUT_BOOST_DB_MAX,
+};
 
 const MAX_VOICES: usize = 16;
 
@@ -155,8 +157,8 @@ impl AudioEngine {
             .store(bpm_milli.clamp(BPM_MIN, BPM_MAX), Ordering::Relaxed);
     }
 
-    pub fn set_volume_percent(&self, volume_percent: u8) {
-        let gain = f32::from(volume_percent.min(100)) / 100.0;
+    pub fn set_output_level(&self, volume_percent: u8, output_boost_db: f32) {
+        let gain = output_gain(volume_percent, output_boost_db);
         self.shared
             .gain_bits
             .store(gain.to_bits(), Ordering::Relaxed);
@@ -180,6 +182,12 @@ impl AudioEngine {
             offset_ms.clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS),
             Ordering::Relaxed,
         );
+    }
+
+    pub fn set_subdivision(&self, subdivision: u8) {
+        self.shared
+            .subdivision
+            .store(u32::from(subdivision.clamp(1, 8)), Ordering::Relaxed);
     }
 
     pub fn poll_events(&mut self) -> Vec<AudioEvent> {
@@ -228,6 +236,7 @@ struct AudioShared {
     beats_per_bar: AtomicU32,
     beat_unit: AtomicU32,
     click_offset_ms: AtomicI32,
+    subdivision: AtomicU32,
 }
 
 impl AudioShared {
@@ -236,7 +245,7 @@ impl AudioShared {
             running: AtomicBool::new(false),
             bpm_milli: AtomicU32::new(config.bpm_milli.clamp(BPM_MIN, BPM_MAX)),
             gain_bits: AtomicU32::new(
-                (f32::from(config.volume_percent.min(100)) / 100.0).to_bits(),
+                output_gain(config.volume_percent, config.audio.output_boost_db).to_bits(),
             ),
             beats_per_bar: AtomicU32::new(u32::from(
                 config.time_signature.beats_per_bar.clamp(1, 16),
@@ -248,6 +257,7 @@ impl AudioShared {
                     .click_timing_offset_ms
                     .clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS),
             ),
+            subdivision: AtomicU32::new(u32::from(config.audio.subdivision.clamp(1, 8))),
         }
     }
 }
@@ -330,10 +340,14 @@ impl RenderState {
             let beats_per_bar = self.shared.beats_per_bar.load(Ordering::Relaxed) as u8;
             let beat_unit = self.shared.beat_unit.load(Ordering::Relaxed) as u8;
             let click_offset_ms = self.shared.click_offset_ms.load(Ordering::Relaxed);
-            if let Some(beat) =
-                self.scheduler
-                    .advance_frame(bpm_milli, beats_per_bar, beat_unit, click_offset_ms)
-            {
+            let subdivision = self.shared.subdivision.load(Ordering::Relaxed) as u8;
+            if let Some(beat) = self.scheduler.advance_frame(
+                bpm_milli,
+                beats_per_bar,
+                beat_unit,
+                subdivision,
+                click_offset_ms,
+            ) {
                 self.trigger_voice(beat);
             }
         }
@@ -348,6 +362,8 @@ impl RenderState {
             voice.position = 0;
             voice.sample = if beat.is_accent {
                 VoiceSample::Accent
+            } else if beat.subdivision_index > 0 {
+                VoiceSample::Subdivision
             } else {
                 VoiceSample::Normal
             };
@@ -367,13 +383,14 @@ impl RenderState {
                 continue;
             }
 
-            let samples = match voice.sample {
-                VoiceSample::Normal => &self.sample_bank.normal,
-                VoiceSample::Accent => &self.sample_bank.accent,
+            let (samples, sample_gain) = match voice.sample {
+                VoiceSample::Normal => (&self.sample_bank.normal, 1.0),
+                VoiceSample::Accent => (&self.sample_bank.accent, 1.0),
+                VoiceSample::Subdivision => (&self.sample_bank.normal, 0.6),
             };
 
             if let Some(sample) = samples.get(voice.position) {
-                mixed += *sample;
+                mixed += *sample * sample_gain;
                 voice.position += 1;
             } else {
                 voice.active = false;
@@ -383,7 +400,8 @@ impl RenderState {
     }
 
     fn advance_gain(&mut self) {
-        let target = f32::from_bits(self.shared.gain_bits.load(Ordering::Relaxed)).clamp(0.0, 1.0);
+        let target = f32::from_bits(self.shared.gain_bits.load(Ordering::Relaxed))
+            .clamp(0.0, db_to_gain(OUTPUT_BOOST_DB_MAX));
         if (self.current_gain - target).abs() <= self.gain_step {
             self.current_gain = target;
         } else if self.current_gain < target {
@@ -406,6 +424,16 @@ enum VoiceSample {
     #[default]
     Normal,
     Accent,
+    Subdivision,
+}
+
+fn output_gain(volume_percent: u8, output_boost_db: f32) -> f32 {
+    let volume = f32::from(volume_percent.min(100)) / 100.0;
+    volume * db_to_gain(output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX))
+}
+
+fn db_to_gain(db: f32) -> f32 {
+    10.0_f32.powf(db / 20.0)
 }
 
 fn build_stream<T>(
@@ -428,4 +456,16 @@ where
         },
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_gain;
+
+    #[test]
+    fn twelve_db_boost_uses_expected_linear_gain() {
+        let gain = output_gain(100, 12.0);
+        assert!((gain - 3.981_071_7).abs() < 0.0001);
+        assert!((output_gain(50, 12.0) - gain * 0.5).abs() < 0.0001);
+    }
 }

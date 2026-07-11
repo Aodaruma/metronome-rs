@@ -16,7 +16,8 @@ Rust / egui製のクロスプラットフォーム対応メトロノームです
 
 - 円弧/拍リングの2種類のメーター
 - BPM 20〜1000 入力可能
-- BPMプリセット、カスタムクリック音、音量・発音タイミング補正
+- BPMプリセット、2～8分割のSubdivision、カスタムクリック音
+- 最大+12 dBの音量ブースト、発音タイミング補正
 - ライト/ダークテーマ対応、アクセントカラーのカスタマイズ
 - 通知領域でのバックグラウンド動作、PC起動時の自動起動
 - カスタマイズ可能なショートカット
@@ -36,7 +37,8 @@ metronome-rs is a desktop metronome for Windows, macOS, and Linux, built with Ru
 
 - Arc and beat-ring meter modes
 - Direct input for BPM 20–1000, beats, and beat unit
-- BPM presets, custom click sounds, volume, and click timing offset
+- BPM presets, 2–8 click subdivisions, and custom click sounds
+- Up to +12 dB output boost and click timing offset
 - Light and dark themes, custom accent color, and optional accent animation
 - Background operation through the system tray and launch at startup
 - Customizable in-app and global shortcuts

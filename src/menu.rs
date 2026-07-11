@@ -23,8 +23,6 @@ pub enum MenuCommand {
     ShowPresets,
     ShowMetronome,
     ShowPreferences,
-    MeterArc,
-    MeterBeatRing,
     ThemeSystem,
     ThemeDark,
     ThemeLight,
@@ -83,8 +81,6 @@ mod native {
     const MENU_SHOW_METRONOME: &str = "view.metronome";
     const MENU_SHOW_PREFERENCES: &str = "view.preferences";
     const MENU_SHOW_SHORTCUT_SETTINGS: &str = "shortcuts.settings";
-    const MENU_METER_ARC: &str = "view.meter_arc";
-    const MENU_METER_BEAT_RING: &str = "view.meter_beat_ring";
     const MENU_THEME_SYSTEM: &str = "view.theme_system";
     const MENU_THEME_DARK: &str = "view.theme_dark";
     const MENU_THEME_LIGHT: &str = "view.theme_light";
@@ -179,13 +175,6 @@ mod native {
 
             let show_metronome = item(MENU_SHOW_METRONOME, language, "メトロノーム", "Metronome");
             let show_preferences = item(MENU_SHOW_PREFERENCES, language, "環境設定", "Preferences");
-            let meter_arc = item(MENU_METER_ARC, language, "円弧モード", "Arc mode");
-            let meter_beat_ring = item(
-                MENU_METER_BEAT_RING,
-                language,
-                "円形モード",
-                "Beat-ring mode",
-            );
             let theme_system = item(
                 MENU_THEME_SYSTEM,
                 language,
@@ -309,9 +298,6 @@ mod native {
                 &[
                     &show_metronome,
                     &show_preferences,
-                    &PredefinedMenuItem::separator(),
-                    &meter_arc,
-                    &meter_beat_ring,
                     &PredefinedMenuItem::separator(),
                     &theme_system,
                     &theme_dark,
@@ -447,8 +433,6 @@ mod native {
                     MENU_SHOW_METRONOME => MenuCommand::ShowMetronome,
                     MENU_SHOW_PREFERENCES => MenuCommand::ShowPreferences,
                     MENU_SHOW_SHORTCUT_SETTINGS => MenuCommand::ShowPreferences,
-                    MENU_METER_ARC => MenuCommand::MeterArc,
-                    MENU_METER_BEAT_RING => MenuCommand::MeterBeatRing,
                     MENU_THEME_SYSTEM => MenuCommand::ThemeSystem,
                     MENU_THEME_DARK => MenuCommand::ThemeDark,
                     MENU_THEME_LIGHT => MenuCommand::ThemeLight,

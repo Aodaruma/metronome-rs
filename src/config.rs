@@ -11,6 +11,7 @@ pub const BPM_SOFT_MAX: u32 = 300_000;
 pub const BPM_MAX: u32 = 1_000_000;
 pub const CLICK_OFFSET_MIN_MS: i32 = -200;
 pub const CLICK_OFFSET_MAX_MS: i32 = 200;
+pub const OUTPUT_BOOST_DB_MAX: f32 = 12.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -104,10 +105,22 @@ pub struct AppearanceConfig {
     pub accent_center_flash: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
     pub click_timing_offset_ms: i32,
+    pub output_boost_db: f32,
+    pub subdivision: u8,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            click_timing_offset_ms: 0,
+            output_boost_db: 0.0,
+            subdivision: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -168,9 +181,7 @@ impl Default for AppConfig {
             volume_percent: 70,
             presets: Vec::new(),
             sound: SoundConfig::default(),
-            audio: AudioConfig {
-                click_timing_offset_ms: 0,
-            },
+            audio: AudioConfig::default(),
             background: BackgroundConfig::default(),
             shortcuts: ShortcutConfig::default(),
             appearance: AppearanceConfig::default(),
@@ -219,6 +230,11 @@ impl AppConfig {
             .audio
             .click_timing_offset_ms
             .clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS);
+        if !self.audio.output_boost_db.is_finite() {
+            self.audio.output_boost_db = 0.0;
+        }
+        self.audio.output_boost_db = self.audio.output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX);
+        self.audio.subdivision = self.audio.subdivision.clamp(1, 8);
         self.background.toggle_window_shortcut =
             self.background.toggle_window_shortcut.trim().to_owned();
         self.background.toggle_playback_shortcut =
@@ -286,7 +302,7 @@ pub fn save_config(config: &AppConfig) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, BPM_MAX, BpmPreset, LanguageMode};
+    use super::{AppConfig, BPM_MAX, BpmPreset, LanguageMode, OUTPUT_BOOST_DB_MAX};
 
     #[test]
     fn config_without_language_uses_system_default() {
@@ -305,6 +321,8 @@ mod tests {
         assert_eq!(config.shortcuts.toggle_playback, "Space");
         assert_eq!(config.shortcuts.bpm_up, "ArrowUp");
         assert_eq!(config.shortcuts.bpm_down, "ArrowDown");
+        assert_eq!(config.audio.output_boost_db, 0.0);
+        assert_eq!(config.audio.subdivision, 1);
     }
 
     #[test]
@@ -343,5 +361,21 @@ mod tests {
         assert_eq!(config.presets.len(), 1);
         assert_eq!(config.presets[0].name, "Practice");
         assert_eq!(config.presets[0].bpm_milli, BPM_MAX);
+    }
+
+    #[test]
+    fn audio_enhancements_are_sanitized() {
+        let mut config = AppConfig::default();
+        config.audio.output_boost_db = 99.0;
+        config.audio.subdivision = 0;
+        config.sanitize();
+        assert_eq!(config.audio.output_boost_db, OUTPUT_BOOST_DB_MAX);
+        assert_eq!(config.audio.subdivision, 1);
+
+        config.audio.output_boost_db = f32::NAN;
+        config.audio.subdivision = 99;
+        config.sanitize();
+        assert_eq!(config.audio.output_boost_db, 0.0);
+        assert_eq!(config.audio.subdivision, 8);
     }
 }
