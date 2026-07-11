@@ -110,11 +110,33 @@ pub struct AudioConfig {
     pub click_timing_offset_ms: i32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SoundConfig {
+    pub normal_builtin: BuiltinSound,
+    pub accent_builtin: BuiltinSound,
     pub normal_path: Option<PathBuf>,
     pub accent_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinSound {
+    Sin1,
+    Sin2,
+    Sin3,
+    Sin4,
+}
+
+impl Default for SoundConfig {
+    fn default() -> Self {
+        Self {
+            normal_builtin: BuiltinSound::Sin2,
+            accent_builtin: BuiltinSound::Sin1,
+            normal_path: None,
+            accent_path: None,
+        }
+    }
 }
 
 impl CloseBehavior {
@@ -286,7 +308,7 @@ pub fn save_config(config: &AppConfig) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, BPM_MAX, BpmPreset, LanguageMode};
+    use super::{AppConfig, BPM_MAX, BpmPreset, BuiltinSound, LanguageMode};
 
     #[test]
     fn config_without_language_uses_system_default() {
@@ -305,6 +327,8 @@ mod tests {
         assert_eq!(config.shortcuts.toggle_playback, "Space");
         assert_eq!(config.shortcuts.bpm_up, "ArrowUp");
         assert_eq!(config.shortcuts.bpm_down, "ArrowDown");
+        assert_eq!(config.sound.normal_builtin, BuiltinSound::Sin2);
+        assert_eq!(config.sound.accent_builtin, BuiltinSound::Sin1);
     }
 
     #[test]
