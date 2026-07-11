@@ -37,6 +37,8 @@ pub struct MetronomeApp {
     last_beat_time: f64,
     last_accent_time: f64,
     preset_name_draft: String,
+    presets_window_open: bool,
+    about_window_open: bool,
     window_visible: bool,
     force_exit: bool,
 }
@@ -58,8 +60,12 @@ impl MetronomeApp {
             Err(err) => (None, Some(err.to_string())),
         };
         #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let (native_menu, native_menu_error) = match NativeMenu::new(cc, config.language.resolve())
-        {
+        let (native_menu, native_menu_error) = match NativeMenu::new(
+            cc,
+            config.language.resolve(),
+            &config.shortcuts,
+            &config.background,
+        ) {
             Ok(menu) => (Some(menu), None),
             Err(err) => (None, Some(err)),
         };
@@ -82,6 +88,8 @@ impl MetronomeApp {
             last_beat_time: 0.0,
             last_accent_time: -1.0,
             preset_name_draft: String::new(),
+            presets_window_open: false,
+            about_window_open: false,
             window_visible: !start_hidden,
             force_exit: false,
         }
@@ -180,14 +188,53 @@ impl MetronomeApp {
     fn handle_menu_command(&mut self, command: MenuCommand, ctx: &egui::Context) {
         match command {
             MenuCommand::SaveSettings => self.persist_config(),
+            MenuCommand::ChooseNormalSound => self.choose_sound_file(false),
+            MenuCommand::ChooseAccentSound => self.choose_sound_file(true),
+            MenuCommand::ResetSounds => self.reset_all_sound_files(),
             MenuCommand::Quit => self.quit(ctx),
             MenuCommand::TogglePlayback => self.toggle_running(),
             MenuCommand::BpmUp => self.adjust_bpm(1),
             MenuCommand::BpmDown => self.adjust_bpm(-1),
+            MenuCommand::BpmUp10 => self.adjust_bpm(10),
+            MenuCommand::BpmDown10 => self.adjust_bpm(-10),
+            MenuCommand::ResetBpm => self.set_bpm_milli(120_000),
+            MenuCommand::VolumeUp => {
+                self.set_volume_percent(self.config.volume_percent.saturating_add(5))
+            }
+            MenuCommand::VolumeDown => {
+                self.set_volume_percent(self.config.volume_percent.saturating_sub(5))
+            }
+            MenuCommand::BeatsUp => {
+                self.set_beats_per_bar(self.config.time_signature.beats_per_bar.saturating_add(1))
+            }
+            MenuCommand::BeatsDown => {
+                self.set_beats_per_bar(self.config.time_signature.beats_per_bar.saturating_sub(1))
+            }
+            MenuCommand::CycleBeatUnit => {
+                let next = match self.config.time_signature.beat_unit {
+                    2 => 4,
+                    4 => 8,
+                    8 => 16,
+                    _ => 2,
+                };
+                self.set_beat_unit(next);
+            }
+            MenuCommand::SavePreset => self.save_current_preset(),
+            MenuCommand::ShowPresets => {
+                self.tab = AppTab::Metronome;
+                self.presets_window_open = true;
+            }
             MenuCommand::ShowMetronome => self.tab = AppTab::Metronome,
             MenuCommand::ShowPreferences => self.tab = AppTab::Preferences,
             MenuCommand::MeterArc => self.set_meter_mode(MeterMode::Arc),
             MenuCommand::MeterBeatRing => self.set_meter_mode(MeterMode::Circle),
+            MenuCommand::ThemeSystem => self.set_theme(ctx, ThemeMode::System),
+            MenuCommand::ThemeDark => self.set_theme(ctx, ThemeMode::Dark),
+            MenuCommand::ThemeLight => self.set_theme(ctx, ThemeMode::Light),
+            MenuCommand::LanguageSystem => self.set_language(LanguageMode::System),
+            MenuCommand::LanguageJapanese => self.set_language(LanguageMode::Japanese),
+            MenuCommand::LanguageEnglish => self.set_language(LanguageMode::English),
+            MenuCommand::About => self.about_window_open = true,
         }
     }
 
@@ -390,6 +437,13 @@ impl MetronomeApp {
         self.rebuild_audio_engine();
     }
 
+    fn reset_all_sound_files(&mut self) {
+        self.config.sound.normal_path = None;
+        self.config.sound.accent_path = None;
+        self.persist_config();
+        self.rebuild_audio_engine();
+    }
+
     fn rebuild_audio_engine(&mut self) {
         let was_running = self.is_running();
         match AudioEngine::new(&self.config) {
@@ -407,6 +461,13 @@ impl MetronomeApp {
             return;
         }
         self.config.language = language;
+        if let Some(native_menu) = &self.native_menu {
+            native_menu.update_shortcuts(
+                self.language(),
+                &self.config.shortcuts,
+                &self.config.background,
+            );
+        }
         self.persist_config();
     }
 
@@ -423,6 +484,30 @@ impl MetronomeApp {
                     self.handle_menu_command(MenuCommand::SaveSettings, ctx);
                     ui.close();
                 }
+                ui.separator();
+                if ui
+                    .button(tr(
+                        lang,
+                        "通常クリック音を選択…",
+                        "Choose normal click sound…",
+                    ))
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::ChooseNormalSound, ctx);
+                }
+                if ui
+                    .button(tr(lang, "アクセント音を選択…", "Choose accent sound…"))
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::ChooseAccentSound, ctx);
+                }
+                if ui
+                    .button(tr(lang, "クリック音を内蔵音へ戻す", "Reset click sounds"))
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::ResetSounds, ctx);
+                }
+                ui.separator();
                 if ui.button(tr(lang, "終了", "Quit")).clicked() {
                     self.handle_menu_command(MenuCommand::Quit, ctx);
                 }
@@ -444,6 +529,61 @@ impl MetronomeApp {
                 }
                 if ui.button("BPM -1").clicked() {
                     self.handle_menu_command(MenuCommand::BpmDown, ctx);
+                }
+                if ui.button("BPM +10").clicked() {
+                    self.handle_menu_command(MenuCommand::BpmUp10, ctx);
+                }
+                if ui.button("BPM -10").clicked() {
+                    self.handle_menu_command(MenuCommand::BpmDown10, ctx);
+                }
+                if ui
+                    .button(tr(lang, "BPMを120に戻す", "Reset BPM to 120"))
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::ResetBpm, ctx);
+                }
+                ui.separator();
+                if ui.button(tr(lang, "音量 +5%", "Volume +5%")).clicked() {
+                    self.handle_menu_command(MenuCommand::VolumeUp, ctx);
+                }
+                if ui.button(tr(lang, "音量 -5%", "Volume -5%")).clicked() {
+                    self.handle_menu_command(MenuCommand::VolumeDown, ctx);
+                }
+            });
+            ui.menu_button(tr(lang, "拍子", "Time signature"), |ui| {
+                if ui.button(tr(lang, "拍数 +1", "Beats +1")).clicked() {
+                    self.handle_menu_command(MenuCommand::BeatsUp, ctx);
+                }
+                if ui.button(tr(lang, "拍数 -1", "Beats -1")).clicked() {
+                    self.handle_menu_command(MenuCommand::BeatsDown, ctx);
+                }
+                if ui
+                    .button(tr(
+                        lang,
+                        "分母を切り替え（2 / 4 / 8 / 16）",
+                        "Cycle beat unit (2 / 4 / 8 / 16)",
+                    ))
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::CycleBeatUnit, ctx);
+                }
+            });
+            ui.menu_button(tr(lang, "プリセット", "Presets"), |ui| {
+                if ui
+                    .button(tr(
+                        lang,
+                        "現在のBPMをプリセット保存",
+                        "Save current BPM as preset",
+                    ))
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::SavePreset, ctx);
+                }
+                if ui
+                    .button(tr(lang, "プリセットを管理…", "Manage presets…"))
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::ShowPresets, ctx);
                 }
             });
             ui.menu_button(tr(lang, "表示", "View"), |ui| {
@@ -472,14 +612,98 @@ impl MetronomeApp {
                 {
                     self.handle_menu_command(MenuCommand::MeterBeatRing, ctx);
                 }
+                ui.separator();
+                for (mode, japanese, english, command) in [
+                    (
+                        ThemeMode::System,
+                        "テーマ: システム設定",
+                        "Theme: System",
+                        MenuCommand::ThemeSystem,
+                    ),
+                    (
+                        ThemeMode::Dark,
+                        "テーマ: ダーク",
+                        "Theme: Dark",
+                        MenuCommand::ThemeDark,
+                    ),
+                    (
+                        ThemeMode::Light,
+                        "テーマ: ライト",
+                        "Theme: Light",
+                        MenuCommand::ThemeLight,
+                    ),
+                ] {
+                    if ui
+                        .radio(self.config.theme == mode, tr(lang, japanese, english))
+                        .clicked()
+                    {
+                        self.handle_menu_command(command, ctx);
+                    }
+                }
+                ui.separator();
+                for (mode, japanese, english, command) in [
+                    (
+                        LanguageMode::System,
+                        "言語: システム設定",
+                        "Language: System",
+                        MenuCommand::LanguageSystem,
+                    ),
+                    (
+                        LanguageMode::Japanese,
+                        "言語: 日本語",
+                        "Language: Japanese",
+                        MenuCommand::LanguageJapanese,
+                    ),
+                    (
+                        LanguageMode::English,
+                        "言語: English",
+                        "Language: English",
+                        MenuCommand::LanguageEnglish,
+                    ),
+                ] {
+                    if ui
+                        .radio(self.config.language == mode, tr(lang, japanese, english))
+                        .clicked()
+                    {
+                        self.handle_menu_command(command, ctx);
+                    }
+                }
+            });
+            ui.menu_button(tr(lang, "ショートカット", "Shortcuts"), |ui| {
+                ui.label(format!(
+                    "{}: {}",
+                    tr(lang, "再生 / 一時停止", "Play / pause"),
+                    self.config.shortcuts.toggle_playback
+                ));
+                ui.label(format!("BPM +1: {}", self.config.shortcuts.bpm_up));
+                ui.label(format!("BPM -1: {}", self.config.shortcuts.bpm_down));
+                ui.separator();
+                let not_set = tr(lang, "未設定", "Not set");
+                ui.label(format!(
+                    "{}: {}",
+                    tr(lang, "グローバル表示 / 非表示", "Global show / hide"),
+                    non_empty_or(&self.config.background.toggle_window_shortcut, not_set)
+                ));
+                ui.label(format!(
+                    "{}: {}",
+                    tr(lang, "グローバル再生 / 停止", "Global play / pause"),
+                    non_empty_or(&self.config.background.toggle_playback_shortcut, not_set)
+                ));
+                ui.separator();
+                if ui
+                    .button(tr(lang, "ショートカット設定…", "Shortcut settings…"))
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::ShowPreferences, ctx);
+                }
             });
             ui.menu_button(tr(lang, "ヘルプ", "Help"), |ui| {
-                ui.label(format!("metronome-rs {}", env!("CARGO_PKG_VERSION")));
-                ui.label(tr(
-                    lang,
-                    "音声コールバック内で拍を配置します。",
-                    "Beat timing is scheduled in the audio callback.",
-                ));
+                if ui
+                    .button(tr(lang, "metronome-rsについて…", "About metronome-rs…"))
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::About, ctx);
+                }
             });
         });
     }
@@ -919,6 +1143,11 @@ impl MetronomeApp {
             self.config.shortcuts.bpm_up = local_bpm_up;
             self.config.shortcuts.bpm_down = local_bpm_down;
         }
+        if (shortcuts_changed || local_shortcuts_changed)
+            && let Some(native_menu) = &self.native_menu
+        {
+            native_menu.update_shortcuts(lang, &self.config.shortcuts, &self.config.background);
+        }
         if behavior_changed || shortcuts_changed {
             self.sync_background_settings();
         }
@@ -1117,62 +1346,66 @@ impl MetronomeApp {
     }
 
     fn show_preset_popup(&mut self, ui: &mut egui::Ui, button_response: &egui::Response) {
+        egui::Popup::menu(button_response)
+            .id(ui.make_persistent_id("bpm_preset_popup"))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_min_width(270.0);
+                self.show_preset_contents(ui);
+            });
+    }
+
+    fn show_preset_contents(&mut self, ui: &mut egui::Ui) {
         let lang = self.language();
         let presets = self.config.presets.clone();
         let mut save_clicked = false;
         let mut load_id = None;
         let mut delete_id = None;
 
-        egui::Popup::menu(button_response)
-            .id(ui.make_persistent_id("bpm_preset_popup"))
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .show(|ui| {
-                ui.set_min_width(270.0);
-                ui.label(egui::RichText::new(tr(lang, "BPMプリセット", "BPM presets")).strong());
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.preset_name_draft)
-                            .hint_text(tr(lang, "名前（省略可）", "Name (optional)"))
-                            .desired_width(170.0),
-                    );
-                    save_clicked = ui
-                        .add_enabled(
-                            self.config.presets.len() < 32,
-                            egui::Button::new(tr(lang, "保存", "Save")),
-                        )
-                        .clicked();
-                });
-                ui.separator();
+        ui.label(egui::RichText::new(tr(lang, "BPMプリセット", "BPM presets")).strong());
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.preset_name_draft)
+                    .hint_text(tr(lang, "名前（省略可）", "Name (optional)"))
+                    .desired_width(170.0),
+            );
+            save_clicked = ui
+                .add_enabled(
+                    self.config.presets.len() < 32,
+                    egui::Button::new(tr(lang, "保存", "Save")),
+                )
+                .clicked();
+        });
+        ui.separator();
 
-                if presets.is_empty() {
-                    ui.weak(tr(
-                        lang,
-                        "保存されたプリセットはありません。",
-                        "No saved presets.",
-                    ));
+        if presets.is_empty() {
+            ui.weak(tr(
+                lang,
+                "保存されたプリセットはありません。",
+                "No saved presets.",
+            ));
+        }
+        for preset in &presets {
+            ui.horizontal(|ui| {
+                let label = format!("{}  ({} BPM)", preset.name, preset.bpm_milli / 1_000);
+                if ui
+                    .add_sized([220.0, 28.0], egui::Button::new(label))
+                    .clicked()
+                {
+                    load_id = Some(preset.id);
                 }
-                for preset in &presets {
-                    ui.horizontal(|ui| {
-                        let label = format!("{}  ({} BPM)", preset.name, preset.bpm_milli / 1_000);
-                        if ui
-                            .add_sized([220.0, 28.0], egui::Button::new(label))
-                            .clicked()
-                        {
-                            load_id = Some(preset.id);
-                        }
-                        if material_icon_button(
-                            ui,
-                            egui::vec2(30.0, 28.0),
-                            MaterialIcon::Delete,
-                            tr(lang, "削除", "Delete"),
-                        )
-                        .clicked()
-                        {
-                            delete_id = Some(preset.id);
-                        }
-                    });
+                if material_icon_button(
+                    ui,
+                    egui::vec2(30.0, 28.0),
+                    MaterialIcon::Delete,
+                    tr(lang, "削除", "Delete"),
+                )
+                .clicked()
+                {
+                    delete_id = Some(preset.id);
                 }
             });
+        }
 
         if save_clicked {
             self.save_current_preset();
@@ -1182,6 +1415,43 @@ impl MetronomeApp {
         }
         if let Some(id) = delete_id {
             self.delete_preset(id);
+        }
+    }
+
+    fn show_auxiliary_windows(&mut self, ctx: &egui::Context) {
+        if self.presets_window_open {
+            let lang = self.language();
+            let mut open = self.presets_window_open;
+            egui::Window::new(tr(lang, "プリセット管理", "Manage presets"))
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_width(310.0)
+                .show(ctx, |ui| self.show_preset_contents(ui));
+            self.presets_window_open = open;
+        }
+
+        if self.about_window_open {
+            let lang = self.language();
+            let mut open = self.about_window_open;
+            egui::Window::new(tr(lang, "metronome-rsについて", "About metronome-rs"))
+                .open(&mut open)
+                .resizable(false)
+                .collapsible(false)
+                .default_width(330.0)
+                .show(ctx, |ui| {
+                    ui.heading("metronome-rs");
+                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    ui.add_space(8.0);
+                    ui.label(tr(
+                        lang,
+                        "Rust / egui製のクロスプラットフォーム・メトロノーム",
+                        "A cross-platform metronome built with Rust and egui",
+                    ));
+                    ui.add_space(8.0);
+                    ui.label("MIT License · Copyright © 2026 Aodaruma");
+                });
+            self.about_window_open = open;
         }
     }
 
@@ -1878,6 +2148,7 @@ impl eframe::App for MetronomeApp {
                     self.show_status(ui);
                 });
         });
+        self.show_auxiliary_windows(&ctx);
 
         if self.is_running() {
             ctx.request_repaint_after(Duration::from_millis(16));
@@ -1889,6 +2160,14 @@ fn tr(lang: Language, ja: &'static str, en: &'static str) -> &'static str {
     match lang {
         Language::Japanese => ja,
         Language::English => en,
+    }
+}
+
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.trim().is_empty() {
+        fallback
+    } else {
+        value.trim()
     }
 }
 
