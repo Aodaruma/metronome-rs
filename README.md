@@ -1,5 +1,9 @@
 # metronome-rs
 
+[![CI](https://github.com/Aodaruma/metronome-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Aodaruma/metronome-rs/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/Aodaruma/metronome-rs?display_name=tag&sort=semver)](https://github.com/Aodaruma/metronome-rs/releases/latest)
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/Aodaruma?logo=githubsponsors&label=Sponsor)](https://github.com/sponsors/Aodaruma)
+
 [日本語](#日本語) | [English](#english)
 
 ![metronome-rs application preview](docs/images/metronome-preview.png)
