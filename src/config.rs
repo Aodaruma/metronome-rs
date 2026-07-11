@@ -26,6 +26,7 @@ pub struct AppConfig {
     pub sound: SoundConfig,
     pub audio: AudioConfig,
     pub background: BackgroundConfig,
+    pub shortcuts: ShortcutConfig,
     pub appearance: AppearanceConfig,
 }
 
@@ -90,6 +91,14 @@ pub struct BackgroundConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ShortcutConfig {
+    pub toggle_playback: String,
+    pub bpm_up: String,
+    pub bpm_down: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppearanceConfig {
     pub accent_rgb: [u8; 3],
     pub accent_center_flash: bool,
@@ -125,6 +134,16 @@ impl Default for BackgroundConfig {
     }
 }
 
+impl Default for ShortcutConfig {
+    fn default() -> Self {
+        Self {
+            toggle_playback: "Space".to_owned(),
+            bpm_up: "ArrowUp".to_owned(),
+            bpm_down: "ArrowDown".to_owned(),
+        }
+    }
+}
+
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
@@ -153,6 +172,7 @@ impl Default for AppConfig {
                 click_timing_offset_ms: 0,
             },
             background: BackgroundConfig::default(),
+            shortcuts: ShortcutConfig::default(),
             appearance: AppearanceConfig::default(),
         }
     }
@@ -203,6 +223,9 @@ impl AppConfig {
             self.background.toggle_window_shortcut.trim().to_owned();
         self.background.toggle_playback_shortcut =
             self.background.toggle_playback_shortcut.trim().to_owned();
+        self.shortcuts.toggle_playback = self.shortcuts.toggle_playback.trim().to_owned();
+        self.shortcuts.bpm_up = self.shortcuts.bpm_up.trim().to_owned();
+        self.shortcuts.bpm_down = self.shortcuts.bpm_down.trim().to_owned();
     }
 }
 
@@ -279,6 +302,9 @@ mod tests {
 
         let config = serde_json::from_str::<AppConfig>(json).expect("config should migrate");
         assert_eq!(config.language, LanguageMode::System);
+        assert_eq!(config.shortcuts.toggle_playback, "Space");
+        assert_eq!(config.shortcuts.bpm_up, "ArrowUp");
+        assert_eq!(config.shortcuts.bpm_down, "ArrowDown");
     }
 
     #[test]

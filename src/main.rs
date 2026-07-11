@@ -4,6 +4,8 @@ mod config;
 mod fonts;
 mod menu;
 mod platform;
+mod shortcuts;
+mod theme;
 
 use app::MetronomeApp;
 
