@@ -6,39 +6,23 @@
 
 ## 日本語
 
-Rust / eguiで実装した、Windows・macOS・Linux向けのデスクトップメトロノームです。
+Rust / egui製のクロスプラットフォーム対応メトロノームです。
 
 ### 主な機能
 
-- 円弧／拍リングの2種類のメーター
-- BPM 20〜1000、拍数と分母の直接入力
+- 円弧/拍リングの2種類のメーター
+- BPM 20〜1000 入力可能
 - BPMプリセット、カスタムクリック音、音量・発音タイミング補正
-- ライト／ダークテーマ、アクセントカラー、アクセントアニメーション
+- ライト/ダークテーマ対応、アクセントカラーのカスタマイズ
 - 通知領域でのバックグラウンド動作、PC起動時の自動起動
-- カスタマイズ可能なアプリ内／グローバルショートカット
-- 日本語／英語UI
+- カスタマイズ可能なショートカット
+- 日本語/英語　対応
 
 ### ダウンロード
 
-[GitHub Releases](https://github.com/Aodaruma/metronome-rs/releases) から、お使いのOS向けアーカイブをダウンロードしてください。
+[ここ](https://github.com/Aodaruma/metronome-rs/releases) からダウンロードしてください。
 
-### 開発
-
-```sh
-cargo run
-cargo test --locked
-cargo clippy --locked --all-targets --all-features -- -D warnings
-```
-
-Linuxでのビルドには、ALSA、GTK 3、libxdo、Ayatana AppIndicator、X11の開発パッケージが必要です。
-
-### 開発支援
-
-継続的な開発を支援いただける場合は、[GitHub Sponsors](https://github.com/sponsors/Aodaruma)をご利用ください。
-
-### ライセンス
-
-MIT Licenseです。依存ライブラリの通知は[THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES)を参照してください。
+---
 
 ## English
 
@@ -57,6 +41,8 @@ metronome-rs is a desktop metronome for Windows, macOS, and Linux, built with Ru
 ### Download
 
 Download the archive for your operating system from [GitHub Releases](https://github.com/Aodaruma/metronome-rs/releases).
+
+---
 
 ### Development
 
