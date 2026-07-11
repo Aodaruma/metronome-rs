@@ -7,6 +7,7 @@ import argparse
 import os
 import plistlib
 import shutil
+import subprocess
 import tarfile
 import tempfile
 import zipfile
@@ -93,6 +94,7 @@ def package_macos(binary: Path, staging: Path, output: Path, version: str, targe
     shutil.copy2(binary, installed_binary)
     installed_binary.chmod(0o755)
     copy_notices(resources)
+    create_macos_icon(Path("assets/metronome-rs.png"), resources / f"{APP_NAME}.icns", staging)
     with (bundle / "Contents" / "Info.plist").open("wb") as file:
         plistlib.dump(
             {
@@ -101,6 +103,7 @@ def package_macos(binary: Path, staging: Path, output: Path, version: str, targe
                 "CFBundleExecutable": APP_NAME,
                 "CFBundleIdentifier": "rs.metronome.desktop",
                 "CFBundleInfoDictionaryVersion": "6.0",
+                "CFBundleIconFile": f"{APP_NAME}.icns",
                 "CFBundleName": APP_NAME,
                 "CFBundlePackageType": "APPL",
                 "CFBundleShortVersionString": version,
@@ -114,6 +117,33 @@ def package_macos(binary: Path, staging: Path, output: Path, version: str, targe
     with zipfile.ZipFile(archive_path, "w") as archive:
         add_zip_tree(archive, bundle)
     return archive_path
+
+
+def create_macos_icon(source: Path, destination: Path, staging: Path) -> None:
+    iconset = staging / f"{APP_NAME}.iconset"
+    iconset.mkdir()
+    sizes = [
+        (16, "icon_16x16.png"),
+        (32, "icon_16x16@2x.png"),
+        (32, "icon_32x32.png"),
+        (64, "icon_32x32@2x.png"),
+        (128, "icon_128x128.png"),
+        (256, "icon_128x128@2x.png"),
+        (256, "icon_256x256.png"),
+        (512, "icon_256x256@2x.png"),
+        (512, "icon_512x512.png"),
+        (1024, "icon_512x512@2x.png"),
+    ]
+    for pixels, name in sizes:
+        subprocess.run(
+            ["sips", "-z", str(pixels), str(pixels), str(source), "--out", str(iconset / name)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+        )
+    subprocess.run(
+        ["iconutil", "-c", "icns", str(iconset), "-o", str(destination)],
+        check=True,
+    )
 
 
 def main() -> None:
@@ -139,4 +169,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

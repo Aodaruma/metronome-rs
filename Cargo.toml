@@ -2,6 +2,13 @@
 name = "metronome-rs"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
+
+[package.metadata.winresource]
+FileDescription = "metronome-rs desktop metronome"
+ProductName = "metronome-rs"
+OriginalFilename = "metronome-rs.exe"
+LegalCopyright = "Copyright © 2026 Aodaruma"
 
 [dependencies]
 auto-launch = "0.6.0"
@@ -22,3 +29,6 @@ tray-icon = "0.24.1"
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 muda = "0.19.3"
 raw-window-handle = "0.6.2"
+
+[build-dependencies]
+winresource = "0.1.31"

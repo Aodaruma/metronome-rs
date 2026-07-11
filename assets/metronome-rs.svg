@@ -1,6 +1,25 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="metronome-rs">
-  <circle cx="64" cy="64" r="58" fill="#007aaa"/>
-  <path d="M64 24v62M42 91h44" fill="none" stroke="#f5f8fa" stroke-width="10" stroke-linecap="round"/>
-  <circle cx="64" cy="28" r="8" fill="#f5f8fa"/>
-</svg>
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="_レイヤー_1" data-name="レイヤー_1" xmlns="http://www.w3.org/2000/svg" version="1.1" viewBox="0 0 128 128">
+  <!-- Generator: Adobe Illustrator 29.4.0, SVG Export Plug-In . SVG Version: 2.1.0 Build 152)  -->
+  <defs>
+    <style>
+      .st0 {
+        fill: none;
+        stroke: #f5f8fa;
+        stroke-linecap: round;
+        stroke-width: 10px;
+      }
 
+      .st1 {
+        fill: #007aaa;
+      }
+
+      .st2 {
+        fill: #f5f8fa;
+      }
+    </style>
+  </defs>
+  <circle class="st1" cx="64" cy="64" r="58"/>
+  <path class="st0" d="M64,24v62M42,91h44"/>
+  <circle class="st2" cx="64" cy="43.4" r="11.6"/>
+</svg>

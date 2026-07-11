@@ -226,26 +226,12 @@ fn create_tray_icon() -> Result<TrayIcon, String> {
 }
 
 fn tray_icon_image() -> Result<Icon, String> {
-    const SIZE: u32 = 32;
-    let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
-    let center = (SIZE as f32 - 1.0) * 0.5;
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let index = ((y * SIZE + x) * 4) as usize;
-            if distance <= 14.5 {
-                rgba[index..index + 4].copy_from_slice(&[0, 122, 170, 255]);
-            }
-            if (dx.abs() <= 1.4 && (-8.0..=7.0).contains(&dy))
-                || (dy - 7.0).abs() <= 1.4 && (-6.0..=6.0).contains(&dx)
-            {
-                rgba[index..index + 4].copy_from_slice(&[245, 248, 250, 255]);
-            }
-        }
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE)
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/metronome-rs.png"
+    )))
+    .map_err(|error| format!("トレイ画像を読み込めません: {error}"))?;
+    Icon::from_rgba(icon.rgba, icon.width, icon.height)
         .map_err(|error| format!("トレイ画像を作成できません: {error}"))
 }
 
