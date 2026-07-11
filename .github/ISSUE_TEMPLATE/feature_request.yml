@@ -1,0 +1,54 @@
+name: "Feature request / 機能リクエスト"
+description: "Suggest an improvement / 改善案を提案します"
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for sharing your idea.
+        アイデアをお寄せいただきありがとうございます。
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: "Motivation / 背景・目的"
+      description: "What problem would this solve? / どのような問題を解決したいか記載してください。"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "Proposed behavior / 希望する動作"
+      description: "Describe the ideal user experience. / 理想的な操作や結果を記載してください。"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "Alternatives / 代替案"
+      description: "Describe any workarounds or alternatives you considered. / 検討した回避策や代替案があれば記載してください。"
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: "Area / 対象領域"
+      options:
+        - Meter and UI / メーター・UI
+        - Audio and timing / 音声・タイミング
+        - Shortcuts and background behavior / ショートカット・バックグラウンド
+        - Presets and settings / プリセット・設定
+        - Packaging and platform support / 配布・プラットフォーム対応
+        - Other / その他
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: "Checklist / 確認事項"
+      options:
+        - label: "I searched existing issues for similar requests. / 類似リクエストがないことを確認しました。"
+          required: true

@@ -1,0 +1,67 @@
+name: "Bug report / バグ報告"
+description: "Report a reproducible problem / 再現可能な問題を報告します"
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve metronome-rs.
+        metronome-rsの改善にご協力いただきありがとうございます。
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: "Problem / 問題の概要"
+      description: "What happened, and what did you expect? / 実際の結果と期待した結果を記載してください。"
+      placeholder: "A clear and concise description / 簡潔な説明"
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Steps to reproduce / 再現手順"
+      placeholder: |
+        1. Open ...
+        2. Change ...
+        3. See ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: "Operating system / OS"
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS Apple Silicon
+        - macOS Intel
+        - Linux X11
+        - Linux Wayland
+        - Other / その他
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: "Application version / アプリのバージョン"
+      placeholder: "e.g. v0.1.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: "Logs, screenshots, and additional context / ログ・スクリーンショット・補足"
+      description: "Do not include passwords, API keys, or other sensitive data. / パスワードやAPIキーなどの機密情報は含めないでください。"
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: "Checklist / 確認事項"
+      options:
+        - label: "I searched existing issues for duplicates. / 既存Issueに重複がないことを確認しました。"
+          required: true
