@@ -12,9 +12,7 @@ use crate::config::{
 use crate::fonts::install_japanese_font;
 use crate::menu::{MenuCommand, NativeMenu};
 use crate::platform::{PlatformCommand, PlatformRuntime, set_auto_launch, validate_shortcut};
-use crate::shortcuts::{
-    LocalShortcuts, pressed, pressed_allowing_extra_shift, validate_local_shortcut,
-};
+use crate::shortcuts::{LocalShortcuts, pressed, validate_local_shortcut};
 use crate::theme;
 
 const PRESET_SIDEBAR_WIDTH: f32 = 310.0;
@@ -33,6 +31,17 @@ enum SoundKind {
     Normal,
     Accent,
     Subdivision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutCaptureTarget {
+    LocalPlayback,
+    LocalBpmUp,
+    LocalBpmDown,
+    LocalBpmUp10,
+    LocalBpmDown10,
+    GlobalWindow,
+    GlobalPlayback,
 }
 
 pub struct MetronomeApp {
@@ -56,6 +65,7 @@ pub struct MetronomeApp {
     about_window_open: bool,
     window_visible: bool,
     force_exit: bool,
+    shortcut_capture: Option<ShortcutCaptureTarget>,
 }
 
 impl MetronomeApp {
@@ -109,11 +119,12 @@ impl MetronomeApp {
             about_window_open: false,
             window_visible: !start_hidden,
             force_exit: false,
+            shortcut_capture: None,
         }
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() {
+        if self.shortcut_capture.is_some() || ctx.egui_wants_keyboard_input() {
             return;
         }
 
@@ -122,11 +133,14 @@ impl MetronomeApp {
         };
 
         let (toggle, bpm_delta) = ctx.input(|input| {
-            let step = if input.modifiers.shift { 10 } else { 1 };
-            let delta = if pressed_allowing_extra_shift(input, shortcuts.bpm_up) {
-                step
-            } else if pressed_allowing_extra_shift(input, shortcuts.bpm_down) {
-                -step
+            let delta = if pressed(input, shortcuts.bpm_up_10) {
+                10
+            } else if pressed(input, shortcuts.bpm_down_10) {
+                -10
+            } else if pressed(input, shortcuts.bpm_up) {
+                1
+            } else if pressed(input, shortcuts.bpm_down) {
+                -1
             } else {
                 0
             };
@@ -803,6 +817,8 @@ impl MetronomeApp {
                 ));
                 ui.label(format!("BPM +1: {}", self.config.shortcuts.bpm_up));
                 ui.label(format!("BPM -1: {}", self.config.shortcuts.bpm_down));
+                ui.label(format!("BPM +10: {}", self.config.shortcuts.bpm_up_10));
+                ui.label(format!("BPM -10: {}", self.config.shortcuts.bpm_down_10));
                 ui.separator();
                 let not_set = tr(lang, "未設定", "Not set");
                 ui.label(format!(
@@ -1213,7 +1229,24 @@ impl MetronomeApp {
         let mut local_playback = self.config.shortcuts.toggle_playback.clone();
         let mut local_bpm_up = self.config.shortcuts.bpm_up.clone();
         let mut local_bpm_down = self.config.shortcuts.bpm_down.clone();
+        let mut local_bpm_up_10 = self.config.shortcuts.bpm_up_10.clone();
+        let mut local_bpm_down_10 = self.config.shortcuts.bpm_down_10.clone();
         let mut auto_launch_error = None;
+
+        if let Some(target) = self.shortcut_capture
+            && let Some(shortcut) = captured_shortcut(ui.ctx())
+        {
+            match target {
+                ShortcutCaptureTarget::LocalPlayback => local_playback = shortcut,
+                ShortcutCaptureTarget::LocalBpmUp => local_bpm_up = shortcut,
+                ShortcutCaptureTarget::LocalBpmDown => local_bpm_down = shortcut,
+                ShortcutCaptureTarget::LocalBpmUp10 => local_bpm_up_10 = shortcut,
+                ShortcutCaptureTarget::LocalBpmDown10 => local_bpm_down_10 = shortcut,
+                ShortcutCaptureTarget::GlobalWindow => window_shortcut = shortcut,
+                ShortcutCaptureTarget::GlobalPlayback => playback_shortcut = shortcut,
+            }
+            self.shortcut_capture = None;
+        }
 
         egui::Frame::group(ui.style())
             .corner_radius(8.0)
@@ -1268,8 +1301,8 @@ impl MetronomeApp {
                 ui.label(
                     egui::RichText::new(tr(
                         lang,
-                        "例: Space、Ctrl+P（空欄にすると無効）",
-                        "Examples: Space, Ctrl+P (leave empty to disable)",
+                        "ボタンを選択してキーを入力（Escで解除）",
+                        "Select a button and press a key (Esc to clear)",
                     ))
                     .small()
                     .color(ui.visuals().weak_text_color()),
@@ -1279,28 +1312,68 @@ impl MetronomeApp {
                     .spacing([18.0, 8.0])
                     .show(ui, |ui| {
                         ui.label(tr(lang, "再生 / 停止", "Play / pause"));
-                        ui.add(
-                            egui::TextEdit::singleline(&mut local_playback)
-                                .hint_text("Space")
-                                .desired_width(200.0),
-                        );
+                        if shortcut_capture_button(
+                            ui,
+                            lang,
+                            ShortcutCaptureTarget::LocalPlayback,
+                            self.shortcut_capture,
+                            &local_playback,
+                        ) {
+                            self.shortcut_capture = Some(ShortcutCaptureTarget::LocalPlayback);
+                        }
                         ui.end_row();
-                        ui.label("BPM +");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut local_bpm_up)
-                                .hint_text("ArrowUp")
-                                .desired_width(200.0),
-                        );
+                        ui.label("BPM +1");
+                        if shortcut_capture_button(
+                            ui,
+                            lang,
+                            ShortcutCaptureTarget::LocalBpmUp,
+                            self.shortcut_capture,
+                            &local_bpm_up,
+                        ) {
+                            self.shortcut_capture = Some(ShortcutCaptureTarget::LocalBpmUp);
+                        }
                         ui.end_row();
-                        ui.label("BPM -");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut local_bpm_down)
-                                .hint_text("ArrowDown")
-                                .desired_width(200.0),
-                        );
+                        ui.label("BPM -1");
+                        if shortcut_capture_button(
+                            ui,
+                            lang,
+                            ShortcutCaptureTarget::LocalBpmDown,
+                            self.shortcut_capture,
+                            &local_bpm_down,
+                        ) {
+                            self.shortcut_capture = Some(ShortcutCaptureTarget::LocalBpmDown);
+                        }
+                        ui.end_row();
+                        ui.label("BPM +10");
+                        if shortcut_capture_button(
+                            ui,
+                            lang,
+                            ShortcutCaptureTarget::LocalBpmUp10,
+                            self.shortcut_capture,
+                            &local_bpm_up_10,
+                        ) {
+                            self.shortcut_capture = Some(ShortcutCaptureTarget::LocalBpmUp10);
+                        }
+                        ui.end_row();
+                        ui.label("BPM -10");
+                        if shortcut_capture_button(
+                            ui,
+                            lang,
+                            ShortcutCaptureTarget::LocalBpmDown10,
+                            self.shortcut_capture,
+                            &local_bpm_down_10,
+                        ) {
+                            self.shortcut_capture = Some(ShortcutCaptureTarget::LocalBpmDown10);
+                        }
                         ui.end_row();
                     });
-                for value in [&local_playback, &local_bpm_up, &local_bpm_down] {
+                for value in [
+                    &local_playback,
+                    &local_bpm_up,
+                    &local_bpm_down,
+                    &local_bpm_up_10,
+                    &local_bpm_down_10,
+                ] {
                     if let Err(error) = validate_local_shortcut(value) {
                         ui.colored_label(ui.visuals().error_fg_color, error);
                     }
@@ -1309,6 +1382,8 @@ impl MetronomeApp {
                     toggle_playback: local_playback.clone(),
                     bpm_up: local_bpm_up.clone(),
                     bpm_down: local_bpm_down.clone(),
+                    bpm_up_10: local_bpm_up_10.clone(),
+                    bpm_down_10: local_bpm_down_10.clone(),
                 };
                 if let Err(error) = LocalShortcuts::parse(&local_preview) {
                     ui.colored_label(ui.visuals().error_fg_color, error);
@@ -1324,8 +1399,8 @@ impl MetronomeApp {
                 ui.label(
                     egui::RichText::new(tr(
                         lang,
-                        "例: Ctrl+Alt+M（初期値は空欄）",
-                        "Example: Ctrl+Alt+M (empty by default)",
+                        "ボタンを選択してキーを入力（Escで解除）",
+                        "Select a button and press a key (Esc to clear)",
                     ))
                     .small()
                     .color(ui.visuals().weak_text_color()),
@@ -1336,18 +1411,26 @@ impl MetronomeApp {
                         .spacing([18.0, 8.0])
                         .show(ui, |ui| {
                             ui.label(tr(lang, "表示 / 非表示", "Show / hide"));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut window_shortcut)
-                                    .hint_text("Ctrl+Alt+M")
-                                    .desired_width(200.0),
-                            );
+                            if shortcut_capture_button(
+                                ui,
+                                lang,
+                                ShortcutCaptureTarget::GlobalWindow,
+                                self.shortcut_capture,
+                                &window_shortcut,
+                            ) {
+                                self.shortcut_capture = Some(ShortcutCaptureTarget::GlobalWindow);
+                            }
                             ui.end_row();
                             ui.label(tr(lang, "再生 / 停止", "Play / pause"));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut playback_shortcut)
-                                    .hint_text("Ctrl+Alt+P")
-                                    .desired_width(200.0),
-                            );
+                            if shortcut_capture_button(
+                                ui,
+                                lang,
+                                ShortcutCaptureTarget::GlobalPlayback,
+                                self.shortcut_capture,
+                                &playback_shortcut,
+                            ) {
+                                self.shortcut_capture = Some(ShortcutCaptureTarget::GlobalPlayback);
+                            }
                             ui.end_row();
                         });
                 });
@@ -1386,11 +1469,15 @@ impl MetronomeApp {
         }
         let local_shortcuts_changed = local_playback != self.config.shortcuts.toggle_playback
             || local_bpm_up != self.config.shortcuts.bpm_up
-            || local_bpm_down != self.config.shortcuts.bpm_down;
+            || local_bpm_down != self.config.shortcuts.bpm_down
+            || local_bpm_up_10 != self.config.shortcuts.bpm_up_10
+            || local_bpm_down_10 != self.config.shortcuts.bpm_down_10;
         if local_shortcuts_changed {
             self.config.shortcuts.toggle_playback = local_playback;
             self.config.shortcuts.bpm_up = local_bpm_up;
             self.config.shortcuts.bpm_down = local_bpm_down;
+            self.config.shortcuts.bpm_up_10 = local_bpm_up_10;
+            self.config.shortcuts.bpm_down_10 = local_bpm_down_10;
         }
         if (shortcuts_changed || local_shortcuts_changed)
             && let Some(native_menu) = &self.native_menu
@@ -2484,6 +2571,74 @@ fn adjusted_percent(value: u8, delta: i16) -> u8 {
     (i16::from(value) + delta).clamp(0, 100) as u8
 }
 
+fn shortcut_capture_button(
+    ui: &mut egui::Ui,
+    lang: Language,
+    target: ShortcutCaptureTarget,
+    active_target: Option<ShortcutCaptureTarget>,
+    shortcut: &str,
+) -> bool {
+    let active = active_target == Some(target);
+    let label = if active {
+        tr(
+            lang,
+            "キーを入力…（Escで解除）",
+            "Press keys… (Esc to clear)",
+        )
+    } else {
+        non_empty_or(shortcut, tr(lang, "未設定", "Not set"))
+    };
+    ui.add_sized([220.0, 28.0], egui::Button::selectable(active, label))
+        .clicked()
+}
+
+fn captured_shortcut(ctx: &egui::Context) -> Option<String> {
+    ctx.input(|input| {
+        input.events.iter().find_map(|event| match event {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } => {
+                if *key == egui::Key::Escape {
+                    Some(String::new())
+                } else {
+                    Some(format_shortcut(*modifiers, *key))
+                }
+            }
+            _ => None,
+        })
+    })
+}
+
+fn format_shortcut(modifiers: egui::Modifiers, key: egui::Key) -> String {
+    let mut tokens = Vec::with_capacity(4);
+    #[cfg(target_os = "macos")]
+    if modifiers.mac_cmd {
+        tokens.push("Cmd");
+    }
+    if modifiers.ctrl {
+        tokens.push("Ctrl");
+    }
+    if modifiers.alt {
+        tokens.push("Alt");
+    }
+    if modifiers.shift {
+        tokens.push("Shift");
+    }
+    let key_name = match key {
+        egui::Key::ArrowDown => "ArrowDown",
+        egui::Key::ArrowLeft => "ArrowLeft",
+        egui::Key::ArrowRight => "ArrowRight",
+        egui::Key::ArrowUp => "ArrowUp",
+        _ => key.name(),
+    };
+    tokens.push(key_name);
+    tokens.join("+")
+}
+
 fn show_accent_color_editor(ui: &mut egui::Ui, lang: Language, rgb: &mut [u8; 3]) {
     let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
     let picker_state_id = ui.make_persistent_id("accent_color_picker_state");
@@ -2876,9 +3031,11 @@ fn diagnostics_grid(ui: &mut egui::Ui, lang: Language, diagnostics: AudioDiagnos
 
 #[cfg(test)]
 mod tests {
+    use eframe::egui;
+
     use super::{
-        ARC_SWEEP_ANGLE, arc_endpoint_pop, arc_motion_position, normalize_beat_unit,
-        unique_preset_name,
+        ARC_SWEEP_ANGLE, arc_endpoint_pop, arc_motion_position, format_shortcut,
+        normalize_beat_unit, unique_preset_name,
     };
     use crate::config::BpmPreset;
 
@@ -2931,5 +3088,19 @@ mod tests {
         ];
 
         assert_eq!(unique_preset_name(&presets, "Practice"), "Practice (3)");
+    }
+
+    #[test]
+    fn captured_shortcuts_use_parseable_names() {
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
+        assert_eq!(format_shortcut(modifiers, egui::Key::P), "Ctrl+Alt+P");
+        assert_eq!(
+            format_shortcut(egui::Modifiers::SHIFT, egui::Key::ArrowUp),
+            "Shift+ArrowUp"
+        );
     }
 }

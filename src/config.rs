@@ -103,6 +103,8 @@ pub struct ShortcutConfig {
     pub toggle_playback: String,
     pub bpm_up: String,
     pub bpm_down: String,
+    pub bpm_up_10: String,
+    pub bpm_down_10: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +204,8 @@ impl Default for ShortcutConfig {
             toggle_playback: "Space".to_owned(),
             bpm_up: "ArrowUp".to_owned(),
             bpm_down: "ArrowDown".to_owned(),
+            bpm_up_10: "Shift+ArrowUp".to_owned(),
+            bpm_down_10: "Shift+ArrowDown".to_owned(),
         }
     }
 }
@@ -316,6 +320,8 @@ impl AppConfig {
         self.shortcuts.toggle_playback = self.shortcuts.toggle_playback.trim().to_owned();
         self.shortcuts.bpm_up = self.shortcuts.bpm_up.trim().to_owned();
         self.shortcuts.bpm_down = self.shortcuts.bpm_down.trim().to_owned();
+        self.shortcuts.bpm_up_10 = self.shortcuts.bpm_up_10.trim().to_owned();
+        self.shortcuts.bpm_down_10 = self.shortcuts.bpm_down_10.trim().to_owned();
         self.interaction.bpm_drag_sensitivity = sanitize_drag_sensitivity(
             self.interaction.bpm_drag_sensitivity,
             BPM_DRAG_SENSITIVITY_DEFAULT,
@@ -459,6 +465,8 @@ mod tests {
         assert_eq!(config.shortcuts.toggle_playback, "Space");
         assert_eq!(config.shortcuts.bpm_up, "ArrowUp");
         assert_eq!(config.shortcuts.bpm_down, "ArrowDown");
+        assert_eq!(config.shortcuts.bpm_up_10, "Shift+ArrowUp");
+        assert_eq!(config.shortcuts.bpm_down_10, "Shift+ArrowDown");
         assert_eq!(config.audio.output_volume_db, 0.0);
         assert_eq!(config.audio.subdivision, 1);
         assert!(config.sound.accent_enabled);

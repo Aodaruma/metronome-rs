@@ -7,6 +7,8 @@ pub struct LocalShortcuts {
     pub toggle_playback: Option<KeyboardShortcut>,
     pub bpm_up: Option<KeyboardShortcut>,
     pub bpm_down: Option<KeyboardShortcut>,
+    pub bpm_up_10: Option<KeyboardShortcut>,
+    pub bpm_down_10: Option<KeyboardShortcut>,
 }
 
 impl LocalShortcuts {
@@ -15,11 +17,15 @@ impl LocalShortcuts {
             toggle_playback: parse_optional(&config.toggle_playback)?,
             bpm_up: parse_optional(&config.bpm_up)?,
             bpm_down: parse_optional(&config.bpm_down)?,
+            bpm_up_10: parse_optional(&config.bpm_up_10)?,
+            bpm_down_10: parse_optional(&config.bpm_down_10)?,
         };
         let assigned = [
             ("再生 / 停止", shortcuts.toggle_playback),
             ("BPM +", shortcuts.bpm_up),
             ("BPM -", shortcuts.bpm_down),
+            ("BPM +10", shortcuts.bpm_up_10),
+            ("BPM -10", shortcuts.bpm_down_10),
         ];
         for (index, (left_name, left)) in assigned.iter().enumerate() {
             let Some(left) = left else {
@@ -44,20 +50,6 @@ pub fn validate_local_shortcut(value: &str) -> Result<(), String> {
 pub fn pressed(input: &egui::InputState, shortcut: Option<KeyboardShortcut>) -> bool {
     shortcut.is_some_and(|shortcut| {
         input.key_pressed(shortcut.logical_key) && input.modifiers.matches_exact(shortcut.modifiers)
-    })
-}
-
-pub fn pressed_allowing_extra_shift(
-    input: &egui::InputState,
-    shortcut: Option<KeyboardShortcut>,
-) -> bool {
-    shortcut.is_some_and(|shortcut| {
-        let mut pressed_modifiers = input.modifiers;
-        if !shortcut.modifiers.shift {
-            pressed_modifiers.shift = false;
-        }
-        input.key_pressed(shortcut.logical_key)
-            && pressed_modifiers.matches_exact(shortcut.modifiers)
     })
 }
 
@@ -124,6 +116,10 @@ mod tests {
         assert!(validate_local_shortcut("Ctrl+Shift+P").is_ok());
         assert!(validate_local_shortcut("").is_ok());
         assert!(validate_local_shortcut("Ctrl+NotARealKey").is_err());
+        let defaults = LocalShortcuts::parse(&ShortcutConfig::default())
+            .expect("default shortcuts should parse");
+        assert!(defaults.bpm_up_10.is_some());
+        assert!(defaults.bpm_down_10.is_some());
     }
 
     #[test]
@@ -132,6 +128,8 @@ mod tests {
             toggle_playback: "Space".to_owned(),
             bpm_up: "Space".to_owned(),
             bpm_down: "ArrowDown".to_owned(),
+            bpm_up_10: "Shift+ArrowUp".to_owned(),
+            bpm_down_10: "Shift+ArrowDown".to_owned(),
         };
         assert!(LocalShortcuts::parse(&config).is_err());
     }

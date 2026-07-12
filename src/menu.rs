@@ -44,11 +44,19 @@ pub struct NativeMenu {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     bpm_down: muda::MenuItem,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
+    bpm_up_10: muda::MenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    bpm_down_10: muda::MenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     shortcut_toggle_playback: muda::MenuItem,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     shortcut_bpm_up: muda::MenuItem,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     shortcut_bpm_down: muda::MenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    shortcut_bpm_up_10: muda::MenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    shortcut_bpm_down_10: muda::MenuItem,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     global_toggle_window: muda::MenuItem,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -144,8 +152,18 @@ mod native {
                 true,
                 None,
             );
-            let bpm_up_10 = item(MENU_BPM_UP_10, language, "BPM +10", "BPM +10");
-            let bpm_down_10 = item(MENU_BPM_DOWN_10, language, "BPM -10", "BPM -10");
+            let bpm_up_10 = MenuItem::with_id(
+                MENU_BPM_UP_10,
+                shortcut_label(language, "BPM +10", "BPM +10", &shortcuts.bpm_up_10),
+                true,
+                None,
+            );
+            let bpm_down_10 = MenuItem::with_id(
+                MENU_BPM_DOWN_10,
+                shortcut_label(language, "BPM -10", "BPM -10", &shortcuts.bpm_down_10),
+                true,
+                None,
+            );
             let reset_bpm = item(
                 MENU_RESET_BPM,
                 language,
@@ -253,6 +271,20 @@ mod native {
                 "In-app: BPM -1",
                 &shortcuts.bpm_down,
             );
+            let shortcut_bpm_up_10 = shortcut_status_item(
+                "shortcuts.local_bpm_up_10",
+                language,
+                "アプリ内: BPM +10",
+                "In-app: BPM +10",
+                &shortcuts.bpm_up_10,
+            );
+            let shortcut_bpm_down_10 = shortcut_status_item(
+                "shortcuts.local_bpm_down_10",
+                language,
+                "アプリ内: BPM -10",
+                "In-app: BPM -10",
+                &shortcuts.bpm_down_10,
+            );
             let shortcut_settings = item(
                 MENU_SHOW_SHORTCUT_SETTINGS,
                 language,
@@ -332,6 +364,8 @@ mod native {
                     &shortcut_toggle_playback,
                     &shortcut_bpm_up,
                     &shortcut_bpm_down,
+                    &shortcut_bpm_up_10,
+                    &shortcut_bpm_down_10,
                     &PredefinedMenuItem::separator(),
                     &global_toggle_window,
                     &global_toggle_playback,
@@ -357,9 +391,13 @@ mod native {
                 toggle_playback,
                 bpm_up,
                 bpm_down,
+                bpm_up_10,
+                bpm_down_10,
                 shortcut_toggle_playback,
                 shortcut_bpm_up,
                 shortcut_bpm_down,
+                shortcut_bpm_up_10,
+                shortcut_bpm_down_10,
                 global_toggle_window,
                 global_toggle_playback,
             })
@@ -389,6 +427,18 @@ mod native {
                 "BPM -1",
                 &shortcuts.bpm_down,
             ));
+            self.bpm_up_10.set_text(shortcut_label(
+                language,
+                "BPM +10",
+                "BPM +10",
+                &shortcuts.bpm_up_10,
+            ));
+            self.bpm_down_10.set_text(shortcut_label(
+                language,
+                "BPM -10",
+                "BPM -10",
+                &shortcuts.bpm_down_10,
+            ));
             self.shortcut_toggle_playback
                 .set_text(shortcut_status_label(
                     language,
@@ -407,6 +457,18 @@ mod native {
                 "アプリ内: BPM -1",
                 "In-app: BPM -1",
                 &shortcuts.bpm_down,
+            ));
+            self.shortcut_bpm_up_10.set_text(shortcut_status_label(
+                language,
+                "アプリ内: BPM +10",
+                "In-app: BPM +10",
+                &shortcuts.bpm_up_10,
+            ));
+            self.shortcut_bpm_down_10.set_text(shortcut_status_label(
+                language,
+                "アプリ内: BPM -10",
+                "In-app: BPM -10",
+                &shortcuts.bpm_down_10,
             ));
             self.global_toggle_window.set_text(shortcut_status_label(
                 language,
