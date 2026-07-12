@@ -219,12 +219,8 @@ impl MetronomeApp {
             MenuCommand::BpmUp10 => self.adjust_bpm(10),
             MenuCommand::BpmDown10 => self.adjust_bpm(-10),
             MenuCommand::ResetBpm => self.set_bpm_milli(120_000),
-            MenuCommand::VolumeUp => {
-                self.set_volume_percent(self.config.volume_percent.saturating_add(5))
-            }
-            MenuCommand::VolumeDown => {
-                self.set_volume_percent(self.config.volume_percent.saturating_sub(5))
-            }
+            MenuCommand::VolumeUp => self.adjust_all_sound_volumes(5),
+            MenuCommand::VolumeDown => self.adjust_all_sound_volumes(-5),
             MenuCommand::BeatsUp => {
                 self.set_beats_per_bar(self.config.time_signature.beats_per_bar.saturating_add(1))
             }
@@ -297,16 +293,40 @@ impl MetronomeApp {
         self.persist_config();
     }
 
-    fn set_volume_percent(&mut self, volume_percent: u8) {
-        let next = volume_percent.min(100);
-        if self.config.volume_percent == next {
+    fn set_sound_volumes(&mut self, normal: u8, accent: u8, subdivision: u8) {
+        let next = (normal.min(100), accent.min(100), subdivision.min(100));
+        if (
+            self.config.sound.normal_volume_percent,
+            self.config.sound.accent_volume_percent,
+            self.config.sound.subdivision_volume_percent,
+        ) == next
+        {
             return;
         }
-        self.config.volume_percent = next;
-        if let Some(audio) = &self.audio {
-            audio.set_output_level(next, self.config.audio.output_boost_db);
-        }
+        self.config.sound.normal_volume_percent = next.0;
+        self.config.sound.accent_volume_percent = next.1;
+        self.config.sound.subdivision_volume_percent = next.2;
+        self.sync_output_levels();
         self.persist_config();
+    }
+
+    fn adjust_all_sound_volumes(&mut self, delta: i16) {
+        self.set_sound_volumes(
+            adjusted_percent(self.config.sound.normal_volume_percent, delta),
+            adjusted_percent(self.config.sound.accent_volume_percent, delta),
+            adjusted_percent(self.config.sound.subdivision_volume_percent, delta),
+        );
+    }
+
+    fn sync_output_levels(&self) {
+        if let Some(audio) = &self.audio {
+            audio.set_output_levels(
+                self.config.sound.normal_volume_percent,
+                self.config.sound.accent_volume_percent,
+                self.config.sound.subdivision_volume_percent,
+                self.config.audio.output_boost_db,
+            );
+        }
     }
 
     fn set_beats_per_bar(&mut self, beats_per_bar: u8) {
@@ -351,9 +371,7 @@ impl MetronomeApp {
             return;
         }
         self.config.audio.output_boost_db = next;
-        if let Some(audio) = &self.audio {
-            audio.set_output_level(self.config.volume_percent, next);
-        }
+        self.sync_output_levels();
         self.persist_config();
     }
 
@@ -1020,12 +1038,14 @@ impl MetronomeApp {
 
         let lang = self.language();
         ui.add_space(10.0);
-        let mut volume = i32::from(self.config.volume_percent);
+        let mut normal_volume = i32::from(self.config.sound.normal_volume_percent);
+        let mut accent_volume = i32::from(self.config.sound.accent_volume_percent);
+        let mut subdivision_volume = i32::from(self.config.sound.subdivision_volume_percent);
         let mut output_boost_db = self.config.audio.output_boost_db;
         let mut offset_ms = self.config.audio.click_timing_offset_ms;
         let mut subdivision = self.config.audio.subdivision;
         let mut accent_enabled = self.config.sound.accent_enabled;
-        let mut volume_changed = false;
+        let mut sound_volume_changed = false;
         let mut boost_changed = false;
         egui::Frame::group(ui.style())
             .corner_radius(8.0)
@@ -1034,19 +1054,12 @@ impl MetronomeApp {
                 ui.set_width(ui.available_width());
                 ui.label(egui::RichText::new(tr(lang, "サウンド", "Sound")).strong());
                 ui.add_space(6.0);
-                volume_changed = ui
-                    .add(egui::Slider::new(&mut volume, 0..=100).text(tr(
-                        lang,
-                        "音量 (%)",
-                        "Volume (%)",
-                    )))
-                    .changed();
                 boost_changed = ui
                     .add(
                         egui::Slider::new(&mut output_boost_db, 0.0..=OUTPUT_BOOST_DB_MAX)
                             .step_by(0.5)
                             .suffix(" dB")
-                            .text(tr(lang, "音量ブースト", "Volume boost")),
+                            .text(tr(lang, "全体音量ブースト", "Overall volume boost")),
                     )
                     .on_hover_text(tr(
                         lang,
@@ -1065,8 +1078,29 @@ impl MetronomeApp {
                     ),
                 );
                 self.show_sound_file_row(ui, lang, SoundKind::Normal);
+                sound_volume_changed |= ui
+                    .add(egui::Slider::new(&mut normal_volume, 0..=100).text(tr(
+                        lang,
+                        "通常音 音量 (%)",
+                        "Normal volume (%)",
+                    )))
+                    .changed();
                 self.show_sound_file_row(ui, lang, SoundKind::Accent);
+                sound_volume_changed |= ui
+                    .add(egui::Slider::new(&mut accent_volume, 0..=100).text(tr(
+                        lang,
+                        "アクセント 音量 (%)",
+                        "Accent volume (%)",
+                    )))
+                    .changed();
                 self.show_sound_file_row(ui, lang, SoundKind::Subdivision);
+                sound_volume_changed |= ui
+                    .add(egui::Slider::new(&mut subdivision_volume, 0..=100).text(tr(
+                        lang,
+                        "Subdivision 音量 (%)",
+                        "Subdivision volume (%)",
+                    )))
+                    .changed();
                 ui.add_space(8.0);
                 ui.separator();
                 let response = ui.add(
@@ -1094,8 +1128,12 @@ impl MetronomeApp {
                         });
                 });
             });
-        if volume_changed {
-            self.set_volume_percent(volume as u8);
+        if sound_volume_changed {
+            self.set_sound_volumes(
+                normal_volume as u8,
+                accent_volume as u8,
+                subdivision_volume as u8,
+            );
         }
         if boost_changed {
             self.set_output_boost_db(output_boost_db);
@@ -2373,6 +2411,10 @@ fn normalize_beat_unit(value: u8) -> u8 {
         .into_iter()
         .min_by_key(|candidate| candidate.abs_diff(value))
         .unwrap_or(4)
+}
+
+fn adjusted_percent(value: u8, delta: i16) -> u8 {
+    (i16::from(value) + delta).clamp(0, 100) as u8
 }
 
 fn unique_preset_name(presets: &[BpmPreset], requested: &str) -> String {

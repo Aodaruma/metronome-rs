@@ -157,11 +157,29 @@ impl AudioEngine {
             .store(bpm_milli.clamp(BPM_MIN, BPM_MAX), Ordering::Relaxed);
     }
 
-    pub fn set_output_level(&self, volume_percent: u8, output_boost_db: f32) {
-        let gain = output_gain(volume_percent, output_boost_db);
-        self.shared
-            .gain_bits
-            .store(gain.to_bits(), Ordering::Relaxed);
+    pub fn set_output_levels(
+        &self,
+        normal_volume_percent: u8,
+        accent_volume_percent: u8,
+        subdivision_volume_percent: u8,
+        output_boost_db: f32,
+    ) {
+        self.shared.normal_gain_bits.store(
+            percent_gain(normal_volume_percent).to_bits(),
+            Ordering::Relaxed,
+        );
+        self.shared.accent_gain_bits.store(
+            percent_gain(accent_volume_percent).to_bits(),
+            Ordering::Relaxed,
+        );
+        self.shared.subdivision_gain_bits.store(
+            percent_gain(subdivision_volume_percent).to_bits(),
+            Ordering::Relaxed,
+        );
+        self.shared.boost_gain_bits.store(
+            db_to_gain(output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX)).to_bits(),
+            Ordering::Relaxed,
+        );
     }
 
     pub fn set_time_signature(&self, beats_per_bar: u8, beat_unit: u8) {
@@ -236,7 +254,10 @@ struct StreamInfo {
 struct AudioShared {
     running: AtomicBool,
     bpm_milli: AtomicU32,
-    gain_bits: AtomicU32,
+    boost_gain_bits: AtomicU32,
+    normal_gain_bits: AtomicU32,
+    accent_gain_bits: AtomicU32,
+    subdivision_gain_bits: AtomicU32,
     beats_per_bar: AtomicU32,
     beat_unit: AtomicU32,
     click_offset_ms: AtomicI32,
@@ -249,8 +270,17 @@ impl AudioShared {
         Self {
             running: AtomicBool::new(false),
             bpm_milli: AtomicU32::new(config.bpm_milli.clamp(BPM_MIN, BPM_MAX)),
-            gain_bits: AtomicU32::new(
-                output_gain(config.volume_percent, config.audio.output_boost_db).to_bits(),
+            boost_gain_bits: AtomicU32::new(
+                db_to_gain(config.audio.output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX)).to_bits(),
+            ),
+            normal_gain_bits: AtomicU32::new(
+                percent_gain(config.sound.normal_volume_percent).to_bits(),
+            ),
+            accent_gain_bits: AtomicU32::new(
+                percent_gain(config.sound.accent_volume_percent).to_bits(),
+            ),
+            subdivision_gain_bits: AtomicU32::new(
+                percent_gain(config.sound.subdivision_volume_percent).to_bits(),
             ),
             beats_per_bar: AtomicU32::new(u32::from(
                 config.time_signature.beats_per_bar.clamp(1, 16),
@@ -265,6 +295,15 @@ impl AudioShared {
             subdivision: AtomicU32::new(u32::from(config.audio.subdivision.clamp(1, 8))),
             accent_enabled: AtomicBool::new(config.sound.accent_enabled),
         }
+    }
+
+    fn gain_for_sample(&self, sample: VoiceSample) -> f32 {
+        let bits = match sample {
+            VoiceSample::Normal => self.normal_gain_bits.load(Ordering::Relaxed),
+            VoiceSample::Accent => self.accent_gain_bits.load(Ordering::Relaxed),
+            VoiceSample::Subdivision => self.subdivision_gain_bits.load(Ordering::Relaxed),
+        };
+        f32::from_bits(bits).clamp(0.0, 1.0)
     }
 }
 
@@ -299,7 +338,7 @@ impl RenderState {
         event_producer: Producer<AudioEvent>,
         sample_bank: SampleBank,
     ) -> Self {
-        let current_gain = f32::from_bits(shared.gain_bits.load(Ordering::Relaxed));
+        let current_gain = f32::from_bits(shared.boost_gain_bits.load(Ordering::Relaxed));
         Self {
             scheduler: BeatScheduler::new(sample_rate),
             shared,
@@ -368,6 +407,7 @@ impl RenderState {
             voice.position = 0;
             let accent_enabled = self.shared.accent_enabled.load(Ordering::Relaxed);
             voice.sample = voice_sample_for_beat(beat, accent_enabled);
+            voice.gain = self.shared.gain_for_sample(voice.sample);
         } else {
             self.diagnostics.voice_drops.fetch_add(1, Ordering::Relaxed);
         }
@@ -384,14 +424,14 @@ impl RenderState {
                 continue;
             }
 
-            let (samples, sample_gain) = match voice.sample {
-                VoiceSample::Normal => (&self.sample_bank.normal, 1.0),
-                VoiceSample::Accent => (&self.sample_bank.accent, 1.0),
-                VoiceSample::Subdivision => (&self.sample_bank.subdivision, 0.6),
+            let samples = match voice.sample {
+                VoiceSample::Normal => &self.sample_bank.normal,
+                VoiceSample::Accent => &self.sample_bank.accent,
+                VoiceSample::Subdivision => &self.sample_bank.subdivision,
             };
 
             if let Some(sample) = samples.get(voice.position) {
-                mixed += *sample * sample_gain;
+                mixed += *sample * voice.gain;
                 voice.position += 1;
             } else {
                 voice.active = false;
@@ -401,7 +441,7 @@ impl RenderState {
     }
 
     fn advance_gain(&mut self) {
-        let target = f32::from_bits(self.shared.gain_bits.load(Ordering::Relaxed))
+        let target = f32::from_bits(self.shared.boost_gain_bits.load(Ordering::Relaxed))
             .clamp(0.0, db_to_gain(OUTPUT_BOOST_DB_MAX));
         if (self.current_gain - target).abs() <= self.gain_step {
             self.current_gain = target;
@@ -418,6 +458,7 @@ struct Voice {
     active: bool,
     position: usize,
     sample: VoiceSample,
+    gain: f32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -438,9 +479,8 @@ fn voice_sample_for_beat(beat: BeatEvent, accent_enabled: bool) -> VoiceSample {
     }
 }
 
-fn output_gain(volume_percent: u8, output_boost_db: f32) -> f32 {
-    let volume = f32::from(volume_percent.min(100)) / 100.0;
-    volume * db_to_gain(output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX))
+fn percent_gain(volume_percent: u8) -> f32 {
+    f32::from(volume_percent.min(100)) / 100.0
 }
 
 fn db_to_gain(db: f32) -> f32 {
@@ -471,14 +511,14 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{VoiceSample, output_gain, voice_sample_for_beat};
+    use super::{VoiceSample, db_to_gain, percent_gain, voice_sample_for_beat};
     use crate::audio::BeatEvent;
 
     #[test]
-    fn twelve_db_boost_uses_expected_linear_gain() {
-        let gain = output_gain(100, 12.0);
+    fn sound_percent_and_boost_are_independent_gain_stages() {
+        let gain = db_to_gain(12.0);
         assert!((gain - 3.981_071_7).abs() < 0.0001);
-        assert!((output_gain(50, 12.0) - gain * 0.5).abs() < 0.0001);
+        assert!((percent_gain(50) * gain - gain * 0.5).abs() < 0.0001);
     }
 
     #[test]

@@ -15,7 +15,8 @@ pub const BPM_DRAG_SENSITIVITY_DEFAULT: f32 = 1.0 / 3.0;
 pub const TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT: f32 = 0.1;
 pub const DRAG_SENSITIVITY_MIN: f32 = 0.05;
 pub const DRAG_SENSITIVITY_MAX: f32 = 2.0;
-const CONFIG_SCHEMA_VERSION: u32 = 2;
+const CONFIG_SCHEMA_VERSION: u32 = 3;
+const PRESET_SEED_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -145,6 +146,9 @@ pub struct SoundConfig {
     pub accent_path: Option<PathBuf>,
     pub subdivision_path: Option<PathBuf>,
     pub accent_enabled: bool,
+    pub normal_volume_percent: u8,
+    pub accent_volume_percent: u8,
+    pub subdivision_volume_percent: u8,
 }
 
 impl Default for SoundConfig {
@@ -157,6 +161,9 @@ impl Default for SoundConfig {
             accent_path: None,
             subdivision_path: None,
             accent_enabled: true,
+            normal_volume_percent: 70,
+            accent_volume_percent: 70,
+            subdivision_volume_percent: 42,
         }
     }
 }
@@ -275,7 +282,7 @@ impl AppConfig {
             preset.bpm_milli = preset.bpm_milli.clamp(BPM_MIN, BPM_MAX);
         }
         self.presets.retain(|preset| !preset.name.is_empty());
-        if source_schema_version < CONFIG_SCHEMA_VERSION {
+        if source_schema_version < PRESET_SEED_SCHEMA_VERSION {
             self.add_missing_default_presets();
         }
         self.presets.truncate(32);
@@ -288,6 +295,15 @@ impl AppConfig {
         }
         self.audio.output_boost_db = self.audio.output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX);
         self.audio.subdivision = self.audio.subdivision.clamp(1, 8);
+        if source_schema_version < 3 {
+            self.sound.normal_volume_percent = self.volume_percent;
+            self.sound.accent_volume_percent = self.volume_percent;
+            self.sound.subdivision_volume_percent =
+                ((u16::from(self.volume_percent) * 60) / 100) as u8;
+        }
+        self.sound.normal_volume_percent = self.sound.normal_volume_percent.min(100);
+        self.sound.accent_volume_percent = self.sound.accent_volume_percent.min(100);
+        self.sound.subdivision_volume_percent = self.sound.subdivision_volume_percent.min(100);
         self.background.toggle_window_shortcut =
             self.background.toggle_window_shortcut.trim().to_owned();
         self.background.toggle_playback_shortcut =
@@ -416,7 +432,7 @@ pub fn save_config(config: &AppConfig) -> io::Result<()> {
 mod tests {
     use super::{
         AppConfig, BPM_DRAG_SENSITIVITY_DEFAULT, BPM_MAX, BpmPreset, BuiltinSound,
-        DRAG_SENSITIVITY_MAX, LanguageMode, OUTPUT_BOOST_DB_MAX,
+        CONFIG_SCHEMA_VERSION, DRAG_SENSITIVITY_MAX, LanguageMode, OUTPUT_BOOST_DB_MAX,
         TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT,
     };
 
@@ -441,6 +457,9 @@ mod tests {
         assert_eq!(config.audio.output_boost_db, 0.0);
         assert_eq!(config.audio.subdivision, 1);
         assert!(config.sound.accent_enabled);
+        assert_eq!(config.sound.normal_volume_percent, 70);
+        assert_eq!(config.sound.accent_volume_percent, 70);
+        assert_eq!(config.sound.subdivision_volume_percent, 42);
         assert!(config.sound.subdivision_path.is_none());
         assert!(config.presets.iter().any(|preset| preset.name == "Andante"));
         assert!(config.presets.iter().any(|preset| preset.name == "Allegro"));
@@ -492,15 +511,36 @@ mod tests {
         let mut config = AppConfig::default();
         config.audio.output_boost_db = 99.0;
         config.audio.subdivision = 0;
+        config.sound.normal_volume_percent = 200;
+        config.sound.accent_volume_percent = 150;
+        config.sound.subdivision_volume_percent = 101;
         config.sanitize();
         assert_eq!(config.audio.output_boost_db, OUTPUT_BOOST_DB_MAX);
         assert_eq!(config.audio.subdivision, 1);
+        assert_eq!(config.sound.normal_volume_percent, 100);
+        assert_eq!(config.sound.accent_volume_percent, 100);
+        assert_eq!(config.sound.subdivision_volume_percent, 100);
 
         config.audio.output_boost_db = f32::NAN;
         config.audio.subdivision = 99;
         config.sanitize();
         assert_eq!(config.audio.output_boost_db, 0.0);
         assert_eq!(config.audio.subdivision, 8);
+    }
+
+    #[test]
+    fn legacy_volume_migrates_to_individual_sound_levels() {
+        let json = r#"{
+            "schema_version": 2,
+            "volume_percent": 55,
+            "sound": {}
+        }"#;
+
+        let mut config = serde_json::from_str::<AppConfig>(json).expect("config should migrate");
+        config.sanitize();
+        assert_eq!(config.sound.normal_volume_percent, 55);
+        assert_eq!(config.sound.accent_volume_percent, 55);
+        assert_eq!(config.sound.subdivision_volume_percent, 33);
     }
 
     #[test]
@@ -541,7 +581,7 @@ mod tests {
         };
         config.sanitize();
 
-        assert_eq!(config.schema_version, 2);
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
         assert!(
             config
                 .presets
