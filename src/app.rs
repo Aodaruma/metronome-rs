@@ -2410,28 +2410,171 @@ fn adjusted_percent(value: u8, delta: i16) -> u8 {
 }
 
 fn show_accent_color_editor(ui: &mut egui::Ui, lang: Language, rgb: &mut [u8; 3]) {
+    let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+    let picker_state_id = ui.make_persistent_id("accent_color_picker_state");
+    let mut hsva = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<egui::ecolor::Hsva>(picker_state_id))
+        .unwrap_or_else(|| egui::ecolor::Hsva::from(color));
+
     ui.horizontal(|ui| {
         ui.label(tr(lang, "アクセントカラー", "Accent color"));
-        let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(84.0, 24.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 4.0, color);
-        ui.painter().rect_stroke(
-            rect,
-            4.0,
-            egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
-            egui::StrokeKind::Inside,
-        );
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]),
-            egui::FontId::monospace(12.0),
-            theme::readable_text_color(color),
+        let label = egui::RichText::new(format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]))
+            .monospace()
+            .color(theme::readable_text_color(color));
+        let mut response = ui
+            .add(
+                egui::Button::new(label)
+                    .fill(color)
+                    .min_size(egui::vec2(92.0, 26.0)),
+            )
+            .on_hover_text(tr(lang, "クリックして色を選択", "Click to choose a color"));
+        egui::Popup::menu(&response)
+            .id(ui.make_persistent_id("accent_color_picker_popup"))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_min_width(264.0);
+                if opaque_color_picker(ui, &mut hsva) {
+                    response.mark_changed();
+                }
+            });
+    });
+
+    hsva.a = 1.0;
+    let selected = egui::Color32::from(hsva);
+    *rgb = [selected.r(), selected.g(), selected.b()];
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(picker_state_id, hsva));
+}
+
+fn opaque_color_picker(ui: &mut egui::Ui, hsva: &mut egui::ecolor::Hsva) -> bool {
+    let before = *hsva;
+    let sv_size = egui::vec2(240.0, 170.0);
+    let (sv_rect, sv_response) = ui.allocate_exact_size(sv_size, egui::Sense::click_and_drag());
+    if let Some(pointer) = sv_response.interact_pointer_pos() {
+        hsva.s = ((pointer.x - sv_rect.left()) / sv_rect.width()).clamp(0.0, 1.0);
+        hsva.v = ((sv_rect.bottom() - pointer.y) / sv_rect.height()).clamp(0.0, 1.0);
+    }
+    paint_saturation_value_picker(ui.painter(), sv_rect, hsva.h, hsva.s, hsva.v);
+
+    ui.add_space(6.0);
+    let (hue_rect, hue_response) =
+        ui.allocate_exact_size(egui::vec2(240.0, 20.0), egui::Sense::click_and_drag());
+    if let Some(pointer) = hue_response.interact_pointer_pos() {
+        hsva.h = ((pointer.x - hue_rect.left()) / hue_rect.width()).clamp(0.0, 1.0);
+    }
+    paint_hue_picker(ui.painter(), hue_rect, hsva.h);
+
+    ui.add_space(6.0);
+    let selected = egui::Color32::from(*hsva);
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(44.0, 22.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 3.0, selected);
+        ui.label(
+            egui::RichText::new(format!(
+                "#{:02X}{:02X}{:02X}",
+                selected.r(),
+                selected.g(),
+                selected.b()
+            ))
+            .monospace(),
         );
     });
-    ui.add(egui::Slider::new(&mut rgb[0], 0..=255).text("R"));
-    ui.add(egui::Slider::new(&mut rgb[1], 0..=255).text("G"));
-    ui.add(egui::Slider::new(&mut rgb[2], 0..=255).text("B"));
+
+    *hsva != before
+}
+
+fn paint_saturation_value_picker(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    hue: f32,
+    saturation: f32,
+    value: f32,
+) {
+    const STEPS: u32 = 12;
+    let mut mesh = egui::Mesh::default();
+    for y in 0..=STEPS {
+        for x in 0..=STEPS {
+            let s = x as f32 / STEPS as f32;
+            let v = 1.0 - y as f32 / STEPS as f32;
+            mesh.colored_vertex(
+                egui::pos2(
+                    egui::lerp(rect.left()..=rect.right(), s),
+                    egui::lerp(rect.top()..=rect.bottom(), y as f32 / STEPS as f32),
+                ),
+                egui::Color32::from(egui::ecolor::Hsva {
+                    h: hue,
+                    s,
+                    v,
+                    a: 1.0,
+                }),
+            );
+            if x < STEPS && y < STEPS {
+                let row = STEPS + 1;
+                let top_left = y * row + x;
+                mesh.add_triangle(top_left, top_left + 1, top_left + row);
+                mesh.add_triangle(top_left + 1, top_left + row, top_left + row + 1);
+            }
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(120)),
+        egui::StrokeKind::Inside,
+    );
+    let marker = egui::pos2(
+        egui::lerp(rect.left()..=rect.right(), saturation),
+        egui::lerp(rect.bottom()..=rect.top(), value),
+    );
+    let marker_color = egui::Color32::from(egui::ecolor::Hsva {
+        h: hue,
+        s: saturation,
+        v: value,
+        a: 1.0,
+    });
+    painter.circle_filled(marker, 7.0, marker_color);
+    painter.circle_stroke(
+        marker,
+        7.0,
+        egui::Stroke::new(2.0, theme::readable_text_color(marker_color)),
+    );
+}
+
+fn paint_hue_picker(painter: &egui::Painter, rect: egui::Rect, hue: f32) {
+    const STEPS: u32 = 24;
+    let mut mesh = egui::Mesh::default();
+    for x in 0..=STEPS {
+        let h = x as f32 / STEPS as f32;
+        let color = egui::Color32::from(egui::ecolor::Hsva {
+            h,
+            s: 1.0,
+            v: 1.0,
+            a: 1.0,
+        });
+        let position = egui::lerp(rect.left()..=rect.right(), h);
+        mesh.colored_vertex(egui::pos2(position, rect.top()), color);
+        mesh.colored_vertex(egui::pos2(position, rect.bottom()), color);
+        if x < STEPS {
+            let index = x * 2;
+            mesh.add_triangle(index, index + 1, index + 2);
+            mesh.add_triangle(index + 1, index + 2, index + 3);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+    let x = egui::lerp(rect.left()..=rect.right(), hue);
+    painter.line_segment(
+        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+        egui::Stroke::new(2.0, egui::Color32::WHITE),
+    );
+    painter.line_segment(
+        [
+            egui::pos2(x + 2.0, rect.top()),
+            egui::pos2(x + 2.0, rect.bottom()),
+        ],
+        egui::Stroke::new(1.0, egui::Color32::BLACK),
+    );
 }
 
 fn unique_preset_name(presets: &[BpmPreset], requested: &str) -> String {
