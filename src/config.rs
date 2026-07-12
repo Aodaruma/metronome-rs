@@ -12,6 +12,7 @@ pub const BPM_MAX: u32 = 1_000_000;
 pub const CLICK_OFFSET_MIN_MS: i32 = -200;
 pub const CLICK_OFFSET_MAX_MS: i32 = 200;
 pub const OUTPUT_BOOST_DB_MAX: f32 = 12.0;
+const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -169,7 +170,7 @@ impl Default for AppearanceConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: CONFIG_SCHEMA_VERSION,
             language: LanguageMode::System,
             bpm_milli: 120_000,
             time_signature: TimeSignature {
@@ -179,7 +180,7 @@ impl Default for AppConfig {
             theme: ThemeMode::System,
             meter_mode: MeterMode::Arc,
             volume_percent: 70,
-            presets: Vec::new(),
+            presets: default_bpm_presets(),
             sound: SoundConfig::default(),
             audio: AudioConfig::default(),
             background: BackgroundConfig::default(),
@@ -213,7 +214,7 @@ fn detect_system_language() -> Language {
 
 impl AppConfig {
     pub fn sanitize(&mut self) {
-        self.schema_version = 1;
+        let source_schema_version = self.schema_version;
         self.bpm_milli = self.bpm_milli.clamp(BPM_MIN, BPM_MAX);
         self.time_signature.beats_per_bar = self.time_signature.beats_per_bar.clamp(1, 16);
         if !matches!(self.time_signature.beat_unit, 2 | 4 | 8 | 16) {
@@ -225,6 +226,9 @@ impl AppConfig {
             preset.bpm_milli = preset.bpm_milli.clamp(BPM_MIN, BPM_MAX);
         }
         self.presets.retain(|preset| !preset.name.is_empty());
+        if source_schema_version < CONFIG_SCHEMA_VERSION {
+            self.add_missing_default_presets();
+        }
         self.presets.truncate(32);
         self.audio.click_timing_offset_ms = self
             .audio
@@ -242,7 +246,50 @@ impl AppConfig {
         self.shortcuts.toggle_playback = self.shortcuts.toggle_playback.trim().to_owned();
         self.shortcuts.bpm_up = self.shortcuts.bpm_up.trim().to_owned();
         self.shortcuts.bpm_down = self.shortcuts.bpm_down.trim().to_owned();
+        self.schema_version = CONFIG_SCHEMA_VERSION;
     }
+
+    fn add_missing_default_presets(&mut self) {
+        let mut next_id = self
+            .presets
+            .iter()
+            .map(|preset| preset.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        for mut preset in default_bpm_presets() {
+            if self
+                .presets
+                .iter()
+                .any(|current| current.name == preset.name)
+            {
+                continue;
+            }
+            preset.id = next_id;
+            next_id = next_id.saturating_add(1);
+            self.presets.push(preset);
+        }
+    }
+}
+
+fn default_bpm_presets() -> Vec<BpmPreset> {
+    [
+        ("Largo", 50_000),
+        ("Adagio", 70_000),
+        ("Andante", 90_000),
+        ("Moderato", 110_000),
+        ("Allegro", 130_000),
+        ("Vivace", 150_000),
+        ("Presto", 180_000),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (name, bpm_milli))| BpmPreset {
+        id: index as u64 + 1,
+        name: name.to_owned(),
+        bpm_milli,
+    })
+    .collect()
 }
 
 pub fn config_path() -> PathBuf {
@@ -316,13 +363,16 @@ mod tests {
             "audio": { "click_timing_offset_ms": 0 }
         }"#;
 
-        let config = serde_json::from_str::<AppConfig>(json).expect("config should migrate");
+        let mut config = serde_json::from_str::<AppConfig>(json).expect("config should migrate");
+        config.sanitize();
         assert_eq!(config.language, LanguageMode::System);
         assert_eq!(config.shortcuts.toggle_playback, "Space");
         assert_eq!(config.shortcuts.bpm_up, "ArrowUp");
         assert_eq!(config.shortcuts.bpm_down, "ArrowDown");
         assert_eq!(config.audio.output_boost_db, 0.0);
         assert_eq!(config.audio.subdivision, 1);
+        assert!(config.presets.iter().any(|preset| preset.name == "Andante"));
+        assert!(config.presets.iter().any(|preset| preset.name == "Allegro"));
     }
 
     #[test]
@@ -377,5 +427,34 @@ mod tests {
         config.sanitize();
         assert_eq!(config.audio.output_boost_db, 0.0);
         assert_eq!(config.audio.subdivision, 8);
+    }
+
+    #[test]
+    fn default_presets_are_seeded_once_without_overwriting_custom_entries() {
+        let mut config = AppConfig {
+            schema_version: 1,
+            presets: vec![BpmPreset {
+                id: 42,
+                name: "My tempo".to_owned(),
+                bpm_milli: 123_000,
+            }],
+            ..AppConfig::default()
+        };
+        config.sanitize();
+
+        assert_eq!(config.schema_version, 2);
+        assert!(
+            config
+                .presets
+                .iter()
+                .any(|preset| preset.name == "My tempo")
+        );
+        assert!(config.presets.iter().any(|preset| preset.name == "Andante"));
+        let migrated_count = config.presets.len();
+
+        config.presets.retain(|preset| preset.name != "Andante");
+        config.sanitize();
+        assert_eq!(config.presets.len(), migrated_count - 1);
+        assert!(!config.presets.iter().any(|preset| preset.name == "Andante"));
     }
 }

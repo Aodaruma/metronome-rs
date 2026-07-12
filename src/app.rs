@@ -17,10 +17,12 @@ use crate::shortcuts::{
 };
 use crate::theme;
 
+const PRESET_SIDEBAR_WIDTH: f32 = 310.0;
+const PRESET_SIDEBAR_GAP: f32 = 16.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTab {
     Metronome,
-    Presets,
     Preferences,
 }
 
@@ -39,6 +41,7 @@ pub struct MetronomeApp {
     last_beat_time: f64,
     last_accent_time: f64,
     preset_name_draft: String,
+    presets_sidebar_open: bool,
     about_window_open: bool,
     window_visible: bool,
     force_exit: bool,
@@ -89,6 +92,7 @@ impl MetronomeApp {
             last_beat_time: 0.0,
             last_accent_time: -1.0,
             preset_name_draft: String::new(),
+            presets_sidebar_open: false,
             about_window_open: false,
             window_visible: !start_hidden,
             force_exit: false,
@@ -221,10 +225,13 @@ impl MetronomeApp {
             }
             MenuCommand::SavePreset => self.save_current_preset(),
             MenuCommand::ShowPresets => {
-                self.tab = AppTab::Presets;
+                self.tab = AppTab::Metronome;
+                self.set_presets_sidebar_open(ctx, true);
             }
             MenuCommand::ShowMetronome => self.tab = AppTab::Metronome,
             MenuCommand::ShowPreferences => self.tab = AppTab::Preferences,
+            MenuCommand::MeterArc => self.set_meter_mode(MeterMode::Arc),
+            MenuCommand::MeterBeatRing => self.set_meter_mode(MeterMode::Circle),
             MenuCommand::ThemeSystem => self.set_theme(ctx, ThemeMode::System),
             MenuCommand::ThemeDark => self.set_theme(ctx, ThemeMode::Dark),
             MenuCommand::ThemeLight => self.set_theme(ctx, ThemeMode::Light),
@@ -351,6 +358,36 @@ impl MetronomeApp {
         }
         self.config.meter_mode = meter_mode;
         self.persist_config();
+    }
+
+    fn set_presets_sidebar_open(&mut self, ctx: &egui::Context, open: bool) {
+        if self.presets_sidebar_open == open {
+            return;
+        }
+        self.presets_sidebar_open = open;
+
+        let min_width = if open {
+            420.0 + PRESET_SIDEBAR_WIDTH + PRESET_SIDEBAR_GAP
+        } else {
+            420.0
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+            min_width, 560.0,
+        )));
+
+        let current_size = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
+        if let Some(current_size) = current_size {
+            let width_delta = PRESET_SIDEBAR_WIDTH + PRESET_SIDEBAR_GAP;
+            let next_width = if open {
+                current_size.x + width_delta
+            } else {
+                (current_size.x - width_delta).max(420.0)
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                next_width,
+                current_size.y,
+            )));
+        }
     }
 
     fn set_theme(&mut self, ctx: &egui::Context, theme: ThemeMode) {
@@ -615,6 +652,25 @@ impl MetronomeApp {
                     self.handle_menu_command(MenuCommand::ShowPreferences, ctx);
                 }
                 ui.separator();
+                if ui
+                    .radio(
+                        self.config.meter_mode == MeterMode::Arc,
+                        meter_mode_label(lang, MeterMode::Arc),
+                    )
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::MeterArc, ctx);
+                }
+                if ui
+                    .radio(
+                        self.config.meter_mode == MeterMode::Circle,
+                        meter_mode_label(lang, MeterMode::Circle),
+                    )
+                    .clicked()
+                {
+                    self.handle_menu_command(MenuCommand::MeterBeatRing, ctx);
+                }
+                ui.separator();
                 for (mode, japanese, english, command) in [
                     (
                         ThemeMode::System,
@@ -714,9 +770,9 @@ impl MetronomeApp {
         let lang = self.language();
         let (row_rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::hover());
-        let tabs_width = (row_rect.width() - 90.0).clamp(315.0, 400.0);
+        let tabs_width = (row_rect.width() - 100.0).clamp(260.0, 340.0);
         let tab_gap = 6.0;
-        let tab_width = (tabs_width - tab_gap * 2.0) / 3.0;
+        let tab_width = (tabs_width - tab_gap) * 0.5;
         let tabs_left = row_rect.center().x - tabs_width * 0.5;
         let tab_size = egui::vec2(tab_width, 38.0);
         let metronome_rect = egui::Rect::from_center_size(
@@ -724,13 +780,6 @@ impl MetronomeApp {
             tab_size,
         );
         let preferences_rect = egui::Rect::from_center_size(
-            egui::pos2(
-                tabs_left + (tab_width + tab_gap) * 2.0 + tab_width * 0.5,
-                row_rect.center().y,
-            ),
-            tab_size,
-        );
-        let presets_rect = egui::Rect::from_center_size(
             egui::pos2(
                 tabs_left + tab_width + tab_gap + tab_width * 0.5,
                 row_rect.center().y,
@@ -749,18 +798,6 @@ impl MetronomeApp {
             .clicked()
         {
             self.tab = AppTab::Metronome;
-        }
-        if ui
-            .put(
-                presets_rect,
-                egui::Button::selectable(
-                    self.tab == AppTab::Presets,
-                    tr(lang, "プリセット", "Presets"),
-                ),
-            )
-            .clicked()
-        {
-            self.tab = AppTab::Presets;
         }
         if ui
             .put(
@@ -812,24 +849,6 @@ impl MetronomeApp {
             MeterMode::Arc => self.show_arc_meter(ui, meter_size, pulse, accent_pulse),
             MeterMode::Circle => self.show_circle_meter(ui, meter_size, pulse, accent_pulse),
         }
-    }
-
-    fn show_presets(&mut self, ui: &mut egui::Ui) {
-        let lang = self.language();
-        egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(16, 0))
-            .show(ui, |ui| {
-                ui.add_space(8.0);
-                ui.heading(tr(lang, "BPMプリセット", "BPM presets"));
-                ui.add_space(12.0);
-                egui::Frame::group(ui.style())
-                    .corner_radius(8.0)
-                    .inner_margin(12.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        self.show_preset_contents(ui);
-                    });
-            });
     }
 
     fn show_preferences(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1365,6 +1384,54 @@ impl MetronomeApp {
         }
     }
 
+    fn show_meter_toolbar(&mut self, ui: &mut egui::Ui, meter_rect: egui::Rect) {
+        let lang = self.language();
+        let button_size = egui::vec2(40.0, 40.0);
+        let mode_rect = egui::Rect::from_center_size(
+            meter_rect.left_top() + egui::vec2(25.0, 25.0),
+            button_size,
+        );
+        let (mode_icon, mode_tooltip) = match self.config.meter_mode {
+            MeterMode::Arc => (
+                MaterialIcon::CircleMode,
+                tr(lang, "拍リングへ切り替え", "Switch to beat ring"),
+            ),
+            MeterMode::Circle => (
+                MaterialIcon::ArcMode,
+                tr(lang, "円弧へ切り替え", "Switch to arc"),
+            ),
+        };
+        if flat_round_icon_button_at(ui, mode_rect, "meter_mode_toggle", mode_icon, mode_tooltip)
+            .clicked()
+        {
+            self.set_meter_mode(match self.config.meter_mode {
+                MeterMode::Arc => MeterMode::Circle,
+                MeterMode::Circle => MeterMode::Arc,
+            });
+        }
+
+        let preset_rect = egui::Rect::from_center_size(
+            meter_rect.right_top() + egui::vec2(-25.0, 25.0),
+            button_size,
+        );
+        let preset_tooltip = if self.presets_sidebar_open {
+            tr(lang, "BPMプリセットを閉じる", "Close BPM presets")
+        } else {
+            tr(lang, "BPMプリセットを開く", "Open BPM presets")
+        };
+        if flat_round_icon_button_at(
+            ui,
+            preset_rect,
+            "preset_sidebar_button",
+            MaterialIcon::Presets,
+            preset_tooltip,
+        )
+        .clicked()
+        {
+            self.set_presets_sidebar_open(ui.ctx(), !self.presets_sidebar_open);
+        }
+    }
+
     fn show_playback_button_at(&mut self, ui: &mut egui::Ui, center: egui::Pos2) {
         let running = self.is_running();
         let (icon, tooltip) = if running {
@@ -1381,6 +1448,35 @@ impl MetronomeApp {
         }
     }
 
+    fn show_preset_sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let lang = self.language();
+        let mut close_clicked = false;
+        egui::Frame::group(ui.style())
+            .corner_radius(8.0)
+            .inner_margin(12.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.heading(tr(lang, "BPMプリセット", "BPM presets"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close_clicked = ui
+                            .button("×")
+                            .on_hover_text(tr(lang, "閉じる", "Close"))
+                            .clicked();
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("preset_sidebar_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.show_preset_contents(ui));
+            });
+
+        if close_clicked {
+            self.set_presets_sidebar_open(ctx, false);
+        }
+    }
+
     fn show_preset_contents(&mut self, ui: &mut egui::Ui) {
         let lang = self.language();
         let presets = self.config.presets.clone();
@@ -1388,7 +1484,6 @@ impl MetronomeApp {
         let mut load_id = None;
         let mut delete_id = None;
 
-        ui.label(egui::RichText::new(tr(lang, "BPMプリセット", "BPM presets")).strong());
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.preset_name_draft)
@@ -1467,6 +1562,21 @@ impl MetronomeApp {
                 });
             self.about_window_open = open;
         }
+    }
+
+    fn show_main_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.show_tabs(ui, ctx);
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("main_content")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                match self.tab {
+                    AppTab::Metronome => self.show_metronome(ui, ctx),
+                    AppTab::Preferences => self.show_preferences(ui, ctx),
+                }
+                self.show_status(ui);
+            });
     }
 
     fn show_arc_meter(&mut self, ui: &mut egui::Ui, size: f32, pulse: f32, accent_pulse: f32) {
@@ -1572,6 +1682,7 @@ impl MetronomeApp {
         );
         self.show_bpm_editor_in_meter(ui, center, plate_radius);
         self.show_time_signature_editor_in_meter(ui, center);
+        self.show_meter_toolbar(ui, rect);
         self.show_playback_button_at(ui, center + egui::vec2(0.0, base_radius * 0.92));
     }
 
@@ -1641,6 +1752,7 @@ impl MetronomeApp {
         );
         self.show_bpm_editor_in_meter(ui, center, plate_radius);
         self.show_time_signature_editor_in_meter(ui, center);
+        self.show_meter_toolbar(ui, rect);
         self.show_playback_button_at(ui, center + egui::vec2(0.0, radius + 64.0));
     }
 
@@ -1829,7 +1941,10 @@ enum MaterialIcon {
     Remove,
     Play,
     Pause,
+    Presets,
     Delete,
+    ArcMode,
+    CircleMode,
     LightMode,
     DarkMode,
 }
@@ -1971,6 +2086,15 @@ fn paint_material_icon(
                 );
             }
         }
+        MaterialIcon::Presets => {
+            for y in [-7.0, 0.0, 7.0] {
+                painter.circle_filled(center + egui::vec2(-8.0, y), 1.8, color);
+                painter.line_segment(
+                    [center + egui::vec2(-3.0, y), center + egui::vec2(9.0, y)],
+                    egui::Stroke::new(2.0, color),
+                );
+            }
+        }
         MaterialIcon::Delete => {
             painter.rect_stroke(
                 egui::Rect::from_center_size(center + egui::vec2(0.0, 2.0), egui::vec2(11.0, 13.0)),
@@ -1992,6 +2116,29 @@ fn paint_material_icon(
                 ],
                 egui::Stroke::new(1.8, color),
             );
+        }
+        MaterialIcon::ArcMode => {
+            painter.add(egui::Shape::line(
+                arc_points(
+                    center,
+                    9.0,
+                    std::f32::consts::FRAC_PI_2 * 1.5,
+                    std::f32::consts::TAU * 0.75,
+                    18,
+                ),
+                egui::Stroke::new(2.2, color),
+            ));
+        }
+        MaterialIcon::CircleMode => {
+            painter.circle_stroke(center, 9.0, egui::Stroke::new(2.2, color));
+            for direction in [
+                egui::vec2(0.0, -9.0),
+                egui::vec2(9.0, 0.0),
+                egui::vec2(0.0, 9.0),
+                egui::vec2(-9.0, 0.0),
+            ] {
+                painter.circle_filled(center + direction, 2.0, color);
+            }
         }
         MaterialIcon::LightMode => {
             painter.circle_filled(center, 4.5, color);
@@ -2112,19 +2259,27 @@ impl eframe::App for MetronomeApp {
                 self.show_menu(ui, &ctx);
                 ui.separator();
             }
-            self.show_tabs(ui, &ctx);
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .id_salt("main_content")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    match self.tab {
-                        AppTab::Metronome => self.show_metronome(ui, &ctx),
-                        AppTab::Presets => self.show_presets(ui),
-                        AppTab::Preferences => self.show_preferences(ui, &ctx),
-                    }
-                    self.show_status(ui);
+            if self.presets_sidebar_open {
+                let available_width = ui.available_width();
+                let available_height = ui.available_height();
+                let main_width =
+                    (available_width - PRESET_SIDEBAR_WIDTH - PRESET_SIDEBAR_GAP).max(260.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(main_width, available_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| self.show_main_content(ui, &ctx),
+                    );
+                    ui.add_space(PRESET_SIDEBAR_GAP);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(PRESET_SIDEBAR_WIDTH, available_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| self.show_preset_sidebar(ui, &ctx),
+                    );
                 });
+            } else {
+                self.show_main_content(ui, &ctx);
+            }
         });
         self.show_auxiliary_windows(&ctx);
 
