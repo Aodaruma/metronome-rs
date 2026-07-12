@@ -19,6 +19,8 @@ use crate::theme;
 
 const PRESET_SIDEBAR_WIDTH: f32 = 310.0;
 const PRESET_SIDEBAR_GAP: f32 = 16.0;
+const ARC_START_ANGLE: f32 = std::f32::consts::FRAC_PI_2 * 1.5;
+const ARC_SWEEP_ANGLE: f32 = std::f32::consts::TAU * 0.75;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTab {
@@ -1626,9 +1628,9 @@ impl MetronomeApp {
 
         let center = rect.center() + egui::vec2(0.0, -4.0);
         let base_radius = rect.width().min(rect.height()) * 0.40;
-        let radius = base_radius * 0.86;
-        let start_angle = std::f32::consts::PI * 1.25;
-        let sweep_angle = std::f32::consts::FRAC_PI_2;
+        let radius = base_radius;
+        let start_angle = ARC_START_ANGLE;
+        let sweep_angle = ARC_SWEEP_ANGLE;
 
         let visuals = ui.visuals().clone();
         let painter = ui.painter_at(rect);
@@ -2380,7 +2382,7 @@ fn diagnostics_grid(ui: &mut egui::Ui, lang: Language, diagnostics: AudioDiagnos
 
 #[cfg(test)]
 mod tests {
-    use super::{arc_motion_position, normalize_beat_unit, unique_preset_name};
+    use super::{ARC_SWEEP_ANGLE, arc_motion_position, normalize_beat_unit, unique_preset_name};
     use crate::config::BpmPreset;
 
     #[test]
@@ -2391,6 +2393,11 @@ mod tests {
         assert!((arc_motion_position(true, false, 0.5, 0.5) - 1.0).abs() < 0.0001);
         assert!((arc_motion_position(true, true, 0.0, 0.5) - 1.0).abs() < 0.0001);
         assert!((arc_motion_position(true, true, 0.5, 0.5) - 0.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn arc_motion_uses_a_270_degree_path() {
+        assert!((ARC_SWEEP_ANGLE.to_degrees() - 270.0).abs() < 0.0001);
     }
 
     #[test]
