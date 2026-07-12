@@ -123,11 +123,24 @@ impl Default for AudioConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SoundConfig {
     pub normal_path: Option<PathBuf>,
     pub accent_path: Option<PathBuf>,
+    pub subdivision_path: Option<PathBuf>,
+    pub accent_enabled: bool,
+}
+
+impl Default for SoundConfig {
+    fn default() -> Self {
+        Self {
+            normal_path: None,
+            accent_path: None,
+            subdivision_path: None,
+            accent_enabled: true,
+        }
+    }
 }
 
 impl CloseBehavior {
@@ -370,6 +383,8 @@ mod tests {
         assert_eq!(config.shortcuts.bpm_down, "ArrowDown");
         assert_eq!(config.audio.output_boost_db, 0.0);
         assert_eq!(config.audio.subdivision, 1);
+        assert!(config.sound.accent_enabled);
+        assert!(config.sound.subdivision_path.is_none());
         assert!(config.presets.iter().any(|preset| preset.name == "Andante"));
         assert!(config.presets.iter().any(|preset| preset.name == "Allegro"));
     }

@@ -28,6 +28,13 @@ enum AppTab {
     Preferences,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoundKind {
+    Normal,
+    Accent,
+    Subdivision,
+}
+
 pub struct MetronomeApp {
     config: AppConfig,
     audio: Option<AudioEngine>,
@@ -202,8 +209,8 @@ impl MetronomeApp {
     fn handle_menu_command(&mut self, command: MenuCommand, ctx: &egui::Context) {
         match command {
             MenuCommand::SaveSettings => self.persist_config(),
-            MenuCommand::ChooseNormalSound => self.choose_sound_file(false),
-            MenuCommand::ChooseAccentSound => self.choose_sound_file(true),
+            MenuCommand::ChooseNormalSound => self.choose_sound_file(SoundKind::Normal),
+            MenuCommand::ChooseAccentSound => self.choose_sound_file(SoundKind::Accent),
             MenuCommand::ResetSounds => self.reset_all_sound_files(),
             MenuCommand::Quit => self.quit(ctx),
             MenuCommand::TogglePlayback => self.toggle_running(),
@@ -362,6 +369,17 @@ impl MetronomeApp {
         self.persist_config();
     }
 
+    fn set_accent_enabled(&mut self, enabled: bool) {
+        if self.config.sound.accent_enabled == enabled {
+            return;
+        }
+        self.config.sound.accent_enabled = enabled;
+        if let Some(audio) = &self.audio {
+            audio.set_accent_enabled(enabled);
+        }
+        self.persist_config();
+    }
+
     fn set_meter_mode(&mut self, meter_mode: MeterMode) {
         if self.config.meter_mode == meter_mode {
             return;
@@ -473,7 +491,7 @@ impl MetronomeApp {
         self.persist_config();
     }
 
-    fn choose_sound_file(&mut self, accent: bool) {
+    fn choose_sound_file(&mut self, kind: SoundKind) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Audio", &["wav", "flac", "mp3", "ogg"])
             .pick_file()
@@ -486,20 +504,20 @@ impl MetronomeApp {
             return;
         }
 
-        if accent {
-            self.config.sound.accent_path = Some(path);
-        } else {
-            self.config.sound.normal_path = Some(path);
+        match kind {
+            SoundKind::Normal => self.config.sound.normal_path = Some(path),
+            SoundKind::Accent => self.config.sound.accent_path = Some(path),
+            SoundKind::Subdivision => self.config.sound.subdivision_path = Some(path),
         }
         self.persist_config();
         self.rebuild_audio_engine();
     }
 
-    fn reset_sound_file(&mut self, accent: bool) {
-        if accent {
-            self.config.sound.accent_path = None;
-        } else {
-            self.config.sound.normal_path = None;
+    fn reset_sound_file(&mut self, kind: SoundKind) {
+        match kind {
+            SoundKind::Normal => self.config.sound.normal_path = None,
+            SoundKind::Accent => self.config.sound.accent_path = None,
+            SoundKind::Subdivision => self.config.sound.subdivision_path = None,
         }
         self.persist_config();
         self.rebuild_audio_engine();
@@ -508,6 +526,7 @@ impl MetronomeApp {
     fn reset_all_sound_files(&mut self) {
         self.config.sound.normal_path = None;
         self.config.sound.accent_path = None;
+        self.config.sound.subdivision_path = None;
         self.persist_config();
         self.rebuild_audio_engine();
     }
@@ -983,6 +1002,7 @@ impl MetronomeApp {
         let mut output_boost_db = self.config.audio.output_boost_db;
         let mut offset_ms = self.config.audio.click_timing_offset_ms;
         let mut subdivision = self.config.audio.subdivision;
+        let mut accent_enabled = self.config.sound.accent_enabled;
         let mut volume_changed = false;
         let mut boost_changed = false;
         egui::Frame::group(ui.style())
@@ -1014,8 +1034,17 @@ impl MetronomeApp {
                     .changed();
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new(tr(lang, "クリック音", "Click sounds")).strong());
-                self.show_sound_file_row(ui, lang, false);
-                self.show_sound_file_row(ui, lang, true);
+                ui.checkbox(
+                    &mut accent_enabled,
+                    tr(
+                        lang,
+                        "小節先頭にアクセント音を追加",
+                        "Use an accent sound at the start of each bar",
+                    ),
+                );
+                self.show_sound_file_row(ui, lang, SoundKind::Normal);
+                self.show_sound_file_row(ui, lang, SoundKind::Accent);
+                self.show_sound_file_row(ui, lang, SoundKind::Subdivision);
                 ui.add_space(8.0);
                 ui.separator();
                 let response = ui.add(
@@ -1054,6 +1083,9 @@ impl MetronomeApp {
         }
         if subdivision != self.config.audio.subdivision {
             self.set_subdivision(subdivision);
+        }
+        if accent_enabled != self.config.sound.accent_enabled {
+            self.set_accent_enabled(accent_enabled);
         }
 
         ui.add_space(10.0);
@@ -1268,30 +1300,33 @@ impl MetronomeApp {
         }
     }
 
-    fn show_sound_file_row(&mut self, ui: &mut egui::Ui, lang: Language, accent: bool) {
-        let selected_path: Option<PathBuf> = if accent {
-            self.config.sound.accent_path.clone()
-        } else {
-            self.config.sound.normal_path.clone()
+    fn show_sound_file_row(&mut self, ui: &mut egui::Ui, lang: Language, kind: SoundKind) {
+        let selected_path: Option<PathBuf> = match kind {
+            SoundKind::Normal => self.config.sound.normal_path.clone(),
+            SoundKind::Accent => self.config.sound.accent_path.clone(),
+            SoundKind::Subdivision => self.config.sound.subdivision_path.clone(),
         };
-        let label = if accent {
-            tr(lang, "アクセント", "Accent")
-        } else {
-            tr(lang, "通常音", "Normal")
+        let label = match kind {
+            SoundKind::Normal => tr(lang, "通常音", "Normal"),
+            SoundKind::Accent => tr(lang, "アクセント", "Accent"),
+            SoundKind::Subdivision => "Subdivision",
         };
         let display_name = selected_path
             .as_deref()
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
-            .unwrap_or(tr(lang, "内蔵音", "Built-in"));
+            .unwrap_or_else(|| match kind {
+                SoundKind::Subdivision => tr(lang, "通常音を使用", "Use normal sound"),
+                SoundKind::Normal | SoundKind::Accent => tr(lang, "内蔵音", "Built-in"),
+            });
         let mut choose_clicked = false;
         let mut reset_clicked = false;
         let spacing = ui.spacing().item_spacing.x;
         let file_width =
-            (ui.available_width() - 72.0 - 58.0 - 84.0 - spacing * 3.0).clamp(80.0, 170.0);
+            (ui.available_width() - 96.0 - 58.0 - 84.0 - spacing * 3.0).clamp(80.0, 170.0);
 
         ui.horizontal(|ui| {
-            ui.add_sized([72.0, 24.0], egui::Label::new(label));
+            ui.add_sized([96.0, 24.0], egui::Label::new(label));
             let file_label = ui.add_sized(
                 [file_width, 24.0],
                 egui::Label::new(display_name).truncate(),
@@ -1310,15 +1345,20 @@ impl MetronomeApp {
             reset_clicked = ui
                 .add_enabled(
                     selected_path.is_some(),
-                    egui::Button::new(tr(lang, "内蔵に戻す", "Use built-in")),
+                    egui::Button::new(match kind {
+                        SoundKind::Subdivision => tr(lang, "通常音に戻す", "Use normal"),
+                        SoundKind::Normal | SoundKind::Accent => {
+                            tr(lang, "内蔵に戻す", "Use built-in")
+                        }
+                    }),
                 )
                 .clicked();
         });
 
         if choose_clicked {
-            self.choose_sound_file(accent);
+            self.choose_sound_file(kind);
         } else if reset_clicked {
-            self.reset_sound_file(accent);
+            self.reset_sound_file(kind);
         }
     }
 

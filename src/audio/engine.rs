@@ -190,6 +190,10 @@ impl AudioEngine {
             .store(u32::from(subdivision.clamp(1, 8)), Ordering::Relaxed);
     }
 
+    pub fn set_accent_enabled(&self, enabled: bool) {
+        self.shared.accent_enabled.store(enabled, Ordering::Relaxed);
+    }
+
     pub fn poll_events(&mut self) -> Vec<AudioEvent> {
         let mut events = Vec::new();
         while let Ok(event) = self.event_consumer.pop() {
@@ -237,6 +241,7 @@ struct AudioShared {
     beat_unit: AtomicU32,
     click_offset_ms: AtomicI32,
     subdivision: AtomicU32,
+    accent_enabled: AtomicBool,
 }
 
 impl AudioShared {
@@ -258,6 +263,7 @@ impl AudioShared {
                     .clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS),
             ),
             subdivision: AtomicU32::new(u32::from(config.audio.subdivision.clamp(1, 8))),
+            accent_enabled: AtomicBool::new(config.sound.accent_enabled),
         }
     }
 }
@@ -360,13 +366,8 @@ impl RenderState {
         if let Some(voice) = self.voices.iter_mut().find(|voice| !voice.active) {
             voice.active = true;
             voice.position = 0;
-            voice.sample = if beat.is_accent {
-                VoiceSample::Accent
-            } else if beat.subdivision_index > 0 {
-                VoiceSample::Subdivision
-            } else {
-                VoiceSample::Normal
-            };
+            let accent_enabled = self.shared.accent_enabled.load(Ordering::Relaxed);
+            voice.sample = voice_sample_for_beat(beat, accent_enabled);
         } else {
             self.diagnostics.voice_drops.fetch_add(1, Ordering::Relaxed);
         }
@@ -386,7 +387,7 @@ impl RenderState {
             let (samples, sample_gain) = match voice.sample {
                 VoiceSample::Normal => (&self.sample_bank.normal, 1.0),
                 VoiceSample::Accent => (&self.sample_bank.accent, 1.0),
-                VoiceSample::Subdivision => (&self.sample_bank.normal, 0.6),
+                VoiceSample::Subdivision => (&self.sample_bank.subdivision, 0.6),
             };
 
             if let Some(sample) = samples.get(voice.position) {
@@ -419,12 +420,22 @@ struct Voice {
     sample: VoiceSample,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum VoiceSample {
     #[default]
     Normal,
     Accent,
     Subdivision,
+}
+
+fn voice_sample_for_beat(beat: BeatEvent, accent_enabled: bool) -> VoiceSample {
+    if beat.is_accent && accent_enabled {
+        VoiceSample::Accent
+    } else if beat.subdivision_index > 0 {
+        VoiceSample::Subdivision
+    } else {
+        VoiceSample::Normal
+    }
 }
 
 fn output_gain(volume_percent: u8, output_boost_db: f32) -> f32 {
@@ -460,12 +471,36 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::output_gain;
+    use super::{VoiceSample, output_gain, voice_sample_for_beat};
+    use crate::audio::BeatEvent;
 
     #[test]
     fn twelve_db_boost_uses_expected_linear_gain() {
         let gain = output_gain(100, 12.0);
         assert!((gain - 3.981_071_7).abs() < 0.0001);
         assert!((output_gain(50, 12.0) - gain * 0.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn accent_can_fall_back_to_the_normal_click() {
+        let accent = BeatEvent {
+            beat_index: 0,
+            beats_per_bar: 4,
+            subdivision_index: 0,
+            subdivisions_per_beat: 4,
+            is_accent: true,
+        };
+        assert_eq!(voice_sample_for_beat(accent, true), VoiceSample::Accent);
+        assert_eq!(voice_sample_for_beat(accent, false), VoiceSample::Normal);
+
+        let subdivision = BeatEvent {
+            subdivision_index: 1,
+            is_accent: false,
+            ..accent
+        };
+        assert_eq!(
+            voice_sample_for_beat(subdivision, false),
+            VoiceSample::Subdivision
+        );
     }
 }
