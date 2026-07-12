@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 pub const APP_NAME: &str = "metronome-rs";
 pub const BPM_MIN: u32 = 20_000;
-pub const BPM_SOFT_MAX: u32 = 300_000;
 pub const BPM_MAX: u32 = 1_000_000;
 pub const CLICK_OFFSET_MIN_MS: i32 = -200;
 pub const CLICK_OFFSET_MAX_MS: i32 = 200;

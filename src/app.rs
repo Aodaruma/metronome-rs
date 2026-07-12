@@ -5,7 +5,7 @@ use eframe::egui;
 
 use crate::audio::{AudioDiagnostics, AudioEngine, BeatEvent, validate_audio_file};
 use crate::config::{
-    AppConfig, BPM_MAX, BPM_MIN, BPM_SOFT_MAX, BpmPreset, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS,
+    AppConfig, BPM_MAX, BPM_MIN, BpmPreset, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS,
     CloseBehavior, Language, LanguageMode, MeterMode, OUTPUT_BOOST_DB_MAX, ThemeMode, load_config,
     save_config,
 };
@@ -40,6 +40,8 @@ pub struct MetronomeApp {
     last_beat: Option<BeatEvent>,
     last_beat_time: f64,
     last_accent_time: f64,
+    last_primary_beat_time: f64,
+    arc_at_end: bool,
     preset_name_draft: String,
     presets_sidebar_open: bool,
     about_window_open: bool,
@@ -91,6 +93,8 @@ impl MetronomeApp {
             last_beat: None,
             last_beat_time: 0.0,
             last_accent_time: -1.0,
+            last_primary_beat_time: -1.0,
+            arc_at_end: false,
             preset_name_draft: String::new(),
             presets_sidebar_open: false,
             about_window_open: false,
@@ -137,6 +141,10 @@ impl MetronomeApp {
         for event in audio.poll_events() {
             self.last_beat = Some(event.beat);
             self.last_beat_time = now;
+            if event.beat.subdivision_index == 0 {
+                self.last_primary_beat_time = now;
+                self.arc_at_end = !self.arc_at_end;
+            }
             if event.beat.is_accent {
                 self.last_accent_time = now;
             }
@@ -846,7 +854,10 @@ impl MetronomeApp {
         let pulse = self.pulse_amount(ctx);
         let accent_pulse = self.accent_pulse_amount(ctx);
         match self.config.meter_mode {
-            MeterMode::Arc => self.show_arc_meter(ui, meter_size, pulse, accent_pulse),
+            MeterMode::Arc => {
+                let motion_ratio = self.arc_motion_ratio(ctx);
+                self.show_arc_meter(ui, meter_size, pulse, accent_pulse, motion_ratio);
+            }
             MeterMode::Circle => self.show_circle_meter(ui, meter_size, pulse, accent_pulse),
         }
     }
@@ -1384,6 +1395,22 @@ impl MetronomeApp {
         }
     }
 
+    fn arc_motion_ratio(&self, ctx: &egui::Context) -> f32 {
+        if self.last_primary_beat_time < 0.0 {
+            return 0.5;
+        }
+        let beat_unit = f64::from(self.config.time_signature.beat_unit.max(1));
+        let beat_interval_seconds =
+            60_000.0 / f64::from(self.config.bpm_milli.max(1)) * 4.0 / beat_unit;
+        let now = ctx.input(|input| input.time);
+        arc_motion_position(
+            self.is_running(),
+            self.arc_at_end,
+            (now - self.last_primary_beat_time).max(0.0),
+            beat_interval_seconds,
+        )
+    }
+
     fn show_meter_toolbar(&mut self, ui: &mut egui::Ui, meter_rect: egui::Rect) {
         let lang = self.language();
         let button_size = egui::vec2(40.0, 40.0);
@@ -1579,81 +1606,53 @@ impl MetronomeApp {
             });
     }
 
-    fn show_arc_meter(&mut self, ui: &mut egui::Ui, size: f32, pulse: f32, accent_pulse: f32) {
+    fn show_arc_meter(
+        &mut self,
+        ui: &mut egui::Ui,
+        size: f32,
+        pulse: f32,
+        accent_pulse: f32,
+        motion_ratio: f32,
+    ) {
         let (rect, response) = centered_row(ui, size, size, |ui| {
-            ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click_and_drag())
+            ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover())
         })
         .inner;
-        let response = response.on_hover_text(tr(
+        response.on_hover_text(tr(
             self.language(),
-            "円弧をクリックまたはドラッグしてBPMを変更",
-            "Click or drag the arc to change BPM",
+            "拍に合わせて左右へ往復します",
+            "Moves back and forth with each beat",
         ));
 
         let center = rect.center() + egui::vec2(0.0, -4.0);
         let base_radius = rect.width().min(rect.height()) * 0.40;
-        let radius = base_radius * (1.0 + pulse * 0.018);
-        let start_angle = std::f32::consts::FRAC_PI_2 * 1.5;
-        let sweep_angle = std::f32::consts::TAU * 0.75;
-
-        if (response.clicked() || response.dragged())
-            && let Some(pointer) = response.interact_pointer_pos()
-        {
-            let distance = pointer.distance(center);
-            if (base_radius * 0.64..=base_radius * 1.18).contains(&distance) {
-                let ratio = arc_ratio_from_pointer(pointer, center, start_angle, sweep_angle);
-                let bpm = egui::lerp(
-                    (BPM_MIN / 1_000) as f32..=(BPM_SOFT_MAX / 1_000) as f32,
-                    ratio,
-                )
-                .round() as u32;
-                self.set_bpm_milli(bpm * 1_000);
-            }
-        }
+        let radius = base_radius * 0.86;
+        let start_angle = std::f32::consts::PI * 1.25;
+        let sweep_angle = std::f32::consts::FRAC_PI_2;
 
         let visuals = ui.visuals().clone();
         let painter = ui.painter_at(rect);
-        let bpm_ratio = ((self.config.bpm_milli.saturating_sub(BPM_MIN)) as f32
-            / (BPM_SOFT_MAX - BPM_MIN) as f32)
-            .clamp(0.0, 1.0);
         let active_color = visuals.selection.bg_fill;
 
         painter.add(egui::Shape::line(
-            arc_points(center, radius, start_angle, sweep_angle, 72),
-            egui::Stroke::new(12.0, visuals.widgets.inactive.bg_fill),
+            arc_points(center, radius, start_angle, sweep_angle, 36),
+            egui::Stroke::new(7.0, visuals.widgets.inactive.bg_fill),
         ));
-        painter.add(egui::Shape::line(
-            arc_points(
-                center,
-                radius,
-                start_angle,
-                sweep_angle * bpm_ratio.max(0.002),
-                ((72.0 * bpm_ratio).ceil() as usize).max(1),
-            ),
-            egui::Stroke::new(12.0 + pulse * 2.0, active_color),
-        ));
-
-        for index in 0..=8 {
-            let ratio = index as f32 / 8.0;
+        for ratio in [0.0_f32, 0.5, 1.0] {
             let angle = start_angle + sweep_angle * ratio;
-            let inner = point_on_arc(center, radius - 14.0, angle);
-            let outer = point_on_arc(center, radius + 14.0, angle);
-            painter.line_segment(
-                [inner, outer],
-                egui::Stroke::new(
-                    if index % 2 == 0 { 2.0 } else { 1.0 },
-                    visuals.weak_text_color(),
-                ),
+            let marker = point_on_arc(center, radius, angle);
+            painter.circle_filled(
+                marker,
+                if ratio == 0.5 { 3.5 } else { 5.0 },
+                visuals.widgets.inactive.bg_fill,
             );
         }
 
-        let knob_angle = start_angle + sweep_angle * bpm_ratio;
-        let knob = point_on_arc(center, radius, knob_angle);
-        painter.circle_filled(knob, 9.0 + pulse * 2.0, active_color);
-        painter.circle_stroke(
-            knob,
-            11.0 + pulse * 2.0,
-            egui::Stroke::new(2.0, visuals.extreme_bg_color),
+        let motion_angle = start_angle + sweep_angle * motion_ratio.clamp(0.0, 1.0);
+        let motion_marker = point_on_arc(center, radius, motion_angle);
+        painter.line_segment(
+            [center, motion_marker],
+            egui::Stroke::new(3.0 + pulse, active_color),
         );
 
         let plate_radius = base_radius * 0.61;
@@ -1673,6 +1672,12 @@ impl MetronomeApp {
             egui::Stroke::new(1.0, visuals.widgets.inactive.bg_stroke.color),
         );
         paint_accent_ring(&painter, center, plate_radius, accent_pulse, active_color);
+        painter.circle_filled(motion_marker, 10.0 + pulse * 2.0, active_color);
+        painter.circle_stroke(
+            motion_marker,
+            12.0 + pulse * 2.0,
+            egui::Stroke::new(2.0, visuals.extreme_bg_color),
+        );
         painter.text(
             center + egui::vec2(0.0, -54.0),
             egui::Align2::CENTER_CENTER,
@@ -2218,25 +2223,18 @@ fn arc_points(
         .collect()
 }
 
-fn arc_ratio_from_pointer(
-    pointer: egui::Pos2,
-    center: egui::Pos2,
-    start_angle: f32,
-    sweep_angle: f32,
+fn arc_motion_position(
+    running: bool,
+    at_end: bool,
+    elapsed_seconds: f64,
+    beat_interval_seconds: f64,
 ) -> f32 {
-    let pointer_angle = (pointer.y - center.y).atan2(pointer.x - center.x);
-    let delta = (pointer_angle - start_angle).rem_euclid(std::f32::consts::TAU);
-    if delta <= sweep_angle {
-        delta / sweep_angle
-    } else {
-        let distance_to_start = std::f32::consts::TAU - delta;
-        let distance_to_end = delta - sweep_angle;
-        if distance_to_start < distance_to_end {
-            0.0
-        } else {
-            1.0
-        }
+    if !running || !beat_interval_seconds.is_finite() || beat_interval_seconds <= 0.0 {
+        return 0.5;
     }
+    let progress = (elapsed_seconds / beat_interval_seconds).clamp(0.0, 1.0) as f32;
+    let eased = 0.5 - 0.5 * (std::f32::consts::PI * progress).cos();
+    if at_end { 1.0 - eased } else { eased }
 }
 
 impl eframe::App for MetronomeApp {
@@ -2382,21 +2380,17 @@ fn diagnostics_grid(ui: &mut egui::Ui, lang: Language, diagnostics: AudioDiagnos
 
 #[cfg(test)]
 mod tests {
-    use super::{arc_ratio_from_pointer, normalize_beat_unit, point_on_arc, unique_preset_name};
+    use super::{arc_motion_position, normalize_beat_unit, unique_preset_name};
     use crate::config::BpmPreset;
-    use eframe::egui;
 
     #[test]
-    fn arc_pointer_mapping_matches_endpoints_and_midpoint() {
-        let center = egui::pos2(100.0, 100.0);
-        let start = std::f32::consts::FRAC_PI_2 * 1.5;
-        let sweep = std::f32::consts::TAU * 0.75;
-
-        for expected in [0.0_f32, 0.5, 1.0] {
-            let pointer = point_on_arc(center, 80.0, start + sweep * expected);
-            let actual = arc_ratio_from_pointer(pointer, center, start, sweep);
-            assert!((actual - expected).abs() < 0.0001);
-        }
+    fn arc_motion_moves_between_endpoints_and_centers_when_stopped() {
+        assert_eq!(arc_motion_position(false, false, 0.0, 0.5), 0.5);
+        assert!((arc_motion_position(true, false, 0.0, 0.5) - 0.0).abs() < 0.0001);
+        assert!((arc_motion_position(true, false, 0.25, 0.5) - 0.5).abs() < 0.0001);
+        assert!((arc_motion_position(true, false, 0.5, 0.5) - 1.0).abs() < 0.0001);
+        assert!((arc_motion_position(true, true, 0.0, 0.5) - 1.0).abs() < 0.0001);
+        assert!((arc_motion_position(true, true, 0.5, 0.5) - 0.0).abs() < 0.0001);
     }
 
     #[test]
