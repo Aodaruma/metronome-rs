@@ -929,13 +929,23 @@ impl MetronomeApp {
         let meter_size = (ui.available_width() - 8.0).clamp(260.0, 496.0);
         let pulse = self.pulse_amount(ctx);
         let accent_pulse = self.accent_pulse_amount(ctx);
+        let subdivision_pulse = self.subdivision_guide_pulse(ctx);
         match self.config.meter_mode {
             MeterMode::Arc => {
                 let motion_ratio = self.arc_motion_ratio(ctx);
                 let endpoint_pop = self.arc_endpoint_pop_amount(ctx);
-                self.show_arc_meter(ui, meter_size, accent_pulse, motion_ratio, endpoint_pop);
+                self.show_arc_meter(
+                    ui,
+                    meter_size,
+                    accent_pulse,
+                    subdivision_pulse,
+                    motion_ratio,
+                    endpoint_pop,
+                );
             }
-            MeterMode::Circle => self.show_circle_meter(ui, meter_size, pulse, accent_pulse),
+            MeterMode::Circle => {
+                self.show_circle_meter(ui, meter_size, pulse, accent_pulse, subdivision_pulse)
+            }
         }
     }
 
@@ -1653,6 +1663,17 @@ impl MetronomeApp {
         }
     }
 
+    fn subdivision_guide_pulse(&self, ctx: &egui::Context) -> f32 {
+        if self
+            .last_beat
+            .is_none_or(|beat| beat.subdivision_index == 0)
+        {
+            return 0.0;
+        }
+        let now = ctx.input(|input| input.time);
+        subdivision_guide_emphasis((now - self.last_beat_time).max(0.0))
+    }
+
     fn accent_pulse_amount(&self, ctx: &egui::Context) -> f32 {
         let now = ctx.input(|input| input.time);
         let elapsed = (now - self.last_accent_time).max(0.0);
@@ -1888,6 +1909,7 @@ impl MetronomeApp {
         ui: &mut egui::Ui,
         size: f32,
         accent_pulse: f32,
+        subdivision_pulse: f32,
         motion_ratio: f32,
         endpoint_pop: f32,
     ) {
@@ -1915,14 +1937,31 @@ impl MetronomeApp {
             arc_points(center, radius, start_angle, sweep_angle, 36),
             egui::Stroke::new(7.0, visuals.widgets.inactive.bg_fill),
         ));
+        let active_subdivision = self.last_beat.and_then(|beat| {
+            let subdivisions = self.config.audio.subdivision;
+            if beat.subdivisions_per_beat != subdivisions || beat.subdivision_index == 0 {
+                None
+            } else if self.arc_at_end {
+                Some(subdivisions - beat.subdivision_index)
+            } else {
+                Some(beat.subdivision_index)
+            }
+        });
         paint_arc_subdivision_guides(
             &painter,
-            center,
-            radius,
-            start_angle,
-            sweep_angle,
-            self.config.audio.subdivision,
-            visuals.weak_text_color(),
+            ArcSubdivisionGuides {
+                center,
+                radius,
+                start_angle,
+                sweep_angle,
+                subdivisions: self.config.audio.subdivision,
+                active_subdivision,
+                style: SubdivisionGuideStyle {
+                    color: visuals.weak_text_color(),
+                    active_color,
+                    pulse: subdivision_pulse,
+                },
+            },
         );
         for ratio in [0.0_f32, 0.5, 1.0] {
             let angle = start_angle + sweep_angle * ratio;
@@ -1987,7 +2026,14 @@ impl MetronomeApp {
         self.show_playback_button_at(ui, center + egui::vec2(0.0, base_radius * 0.92));
     }
 
-    fn show_circle_meter(&mut self, ui: &mut egui::Ui, size: f32, pulse: f32, accent_pulse: f32) {
+    fn show_circle_meter(
+        &mut self,
+        ui: &mut egui::Ui,
+        size: f32,
+        pulse: f32,
+        accent_pulse: f32,
+        subdivision_pulse: f32,
+    ) {
         let (rect, _) = centered_row(ui, size, size, |ui| {
             ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover())
         })
@@ -2005,11 +2051,22 @@ impl MetronomeApp {
         );
         paint_circle_subdivision_guides(
             &painter,
-            center,
-            radius,
-            beats,
-            self.config.audio.subdivision,
-            ui.visuals().weak_text_color(),
+            CircleSubdivisionGuides {
+                center,
+                radius,
+                beats,
+                subdivisions: self.config.audio.subdivision,
+                active_subdivision: self.last_beat.and_then(|beat| {
+                    (beat.subdivisions_per_beat == self.config.audio.subdivision
+                        && beat.subdivision_index > 0)
+                        .then_some((beat.beat_index, beat.subdivision_index))
+                }),
+                style: SubdivisionGuideStyle {
+                    color: ui.visuals().weak_text_color(),
+                    active_color: ui.visuals().selection.bg_fill,
+                    pulse: subdivision_pulse,
+                },
+            },
         );
         for index in 0..beats {
             let angle = -std::f32::consts::FRAC_PI_2
@@ -2248,50 +2305,100 @@ fn paint_accent_ring(
     );
 }
 
-fn paint_arc_subdivision_guides(
-    painter: &egui::Painter,
+#[derive(Clone, Copy)]
+struct SubdivisionGuideStyle {
+    color: egui::Color32,
+    active_color: egui::Color32,
+    pulse: f32,
+}
+
+struct ArcSubdivisionGuides {
     center: egui::Pos2,
     radius: f32,
     start_angle: f32,
     sweep_angle: f32,
     subdivisions: u8,
-    color: egui::Color32,
-) {
-    let subdivisions = subdivisions.clamp(1, 8);
+    active_subdivision: Option<u8>,
+    style: SubdivisionGuideStyle,
+}
+
+fn paint_arc_subdivision_guides(painter: &egui::Painter, guides: ArcSubdivisionGuides) {
+    let subdivisions = guides.subdivisions.clamp(1, 8);
     for index in 1..subdivisions {
         let ratio = f32::from(index) / f32::from(subdivisions);
-        let angle = start_angle + sweep_angle * ratio;
+        let angle = guides.start_angle + guides.sweep_angle * ratio;
+        let active = guides.active_subdivision == Some(index) && guides.style.pulse > 0.0;
+        let extension = 9.0
+            + if active {
+                7.0 * guides.style.pulse
+            } else {
+                0.0
+            };
         painter.line_segment(
             [
-                point_on_arc(center, radius - 9.0, angle),
-                point_on_arc(center, radius + 9.0, angle),
+                point_on_arc(guides.center, guides.radius - extension, angle),
+                point_on_arc(guides.center, guides.radius + extension, angle),
             ],
-            egui::Stroke::new(1.5, color),
+            egui::Stroke::new(
+                1.5 + if active {
+                    1.5 * guides.style.pulse
+                } else {
+                    0.0
+                },
+                if active {
+                    guides.style.active_color
+                } else {
+                    guides.style.color
+                },
+            ),
         );
     }
 }
 
-fn paint_circle_subdivision_guides(
-    painter: &egui::Painter,
+struct CircleSubdivisionGuides {
     center: egui::Pos2,
     radius: f32,
     beats: u8,
     subdivisions: u8,
-    color: egui::Color32,
-) {
-    let beats = beats.clamp(1, 16);
-    let subdivisions = subdivisions.clamp(1, 8);
+    active_subdivision: Option<(u8, u8)>,
+    style: SubdivisionGuideStyle,
+}
+
+fn paint_circle_subdivision_guides(painter: &egui::Painter, guides: CircleSubdivisionGuides) {
+    let beats = guides.beats.clamp(1, 16);
+    let subdivisions = guides.subdivisions.clamp(1, 8);
     for beat in 0..beats {
         for index in 1..subdivisions {
             let beat_ratio =
                 (f32::from(beat) + f32::from(index) / f32::from(subdivisions)) / f32::from(beats);
             let angle = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * beat_ratio;
+            let active =
+                guides.active_subdivision == Some((beat, index)) && guides.style.pulse > 0.0;
+            let extension = 6.0
+                + if active {
+                    7.0 * guides.style.pulse
+                } else {
+                    0.0
+                };
             painter.line_segment(
                 [
-                    center + egui::vec2(angle.cos(), angle.sin()) * (radius - 6.0),
-                    center + egui::vec2(angle.cos(), angle.sin()) * (radius + 6.0),
+                    guides.center
+                        + egui::vec2(angle.cos(), angle.sin()) * (guides.radius - extension),
+                    guides.center
+                        + egui::vec2(angle.cos(), angle.sin()) * (guides.radius + extension),
                 ],
-                egui::Stroke::new(1.5, color),
+                egui::Stroke::new(
+                    1.5 + if active {
+                        1.5 * guides.style.pulse
+                    } else {
+                        0.0
+                    },
+                    if active {
+                        guides.style.active_color
+                    } else {
+                        guides.style.color
+                    },
+                ),
             );
         }
     }
@@ -2879,6 +2986,12 @@ fn arc_endpoint_pop(elapsed_seconds: f64) -> f32 {
     (1.0 - progress).powi(2)
 }
 
+fn subdivision_guide_emphasis(elapsed_seconds: f64) -> f32 {
+    const EMPHASIS_DURATION_SECONDS: f64 = 0.13;
+    let progress = (elapsed_seconds / EMPHASIS_DURATION_SECONDS).clamp(0.0, 1.0) as f32;
+    (1.0 - progress).powi(2)
+}
+
 impl eframe::App for MetronomeApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_audio_events(ctx);
@@ -3035,7 +3148,7 @@ mod tests {
 
     use super::{
         ARC_SWEEP_ANGLE, arc_endpoint_pop, arc_motion_position, format_shortcut,
-        normalize_beat_unit, unique_preset_name,
+        normalize_beat_unit, subdivision_guide_emphasis, unique_preset_name,
     };
     use crate::config::BpmPreset;
 
@@ -3062,6 +3175,14 @@ mod tests {
         assert!((arc_endpoint_pop(0.07) - 0.25).abs() < 0.0001);
         assert_eq!(arc_endpoint_pop(0.14), 0.0);
         assert_eq!(arc_endpoint_pop(1.0), 0.0);
+    }
+
+    #[test]
+    fn subdivision_guide_emphasis_is_brief() {
+        assert_eq!(subdivision_guide_emphasis(0.0), 1.0);
+        assert!(subdivision_guide_emphasis(0.065) > 0.0);
+        assert_eq!(subdivision_guide_emphasis(0.13), 0.0);
+        assert_eq!(subdivision_guide_emphasis(1.0), 0.0);
     }
 
     #[test]
