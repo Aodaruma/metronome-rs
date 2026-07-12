@@ -1,4 +1,8 @@
+use std::collections::VecDeque;
+
 use crate::config::{BPM_MAX, BPM_MIN, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS};
+
+const MAX_DELAYED_EVENTS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BeatEvent {
@@ -20,6 +24,9 @@ pub struct BeatScheduler {
     force_first_click: bool,
     pending_current_click: bool,
     early_next_click_fired: bool,
+    frame_index: u64,
+    delayed_events: VecDeque<(u64, BeatEvent)>,
+    active_offset_ms: i32,
 }
 
 impl BeatScheduler {
@@ -34,6 +41,9 @@ impl BeatScheduler {
             force_first_click: false,
             pending_current_click: false,
             early_next_click_fired: false,
+            frame_index: 0,
+            delayed_events: VecDeque::with_capacity(MAX_DELAYED_EVENTS),
+            active_offset_ms: 0,
         }
     }
 
@@ -54,6 +64,9 @@ impl BeatScheduler {
         self.force_first_click = true;
         self.pending_current_click = false;
         self.early_next_click_fired = false;
+        self.frame_index = 0;
+        self.delayed_events.clear();
+        self.active_offset_ms = 0;
     }
 
     pub fn stop(&mut self) {
@@ -61,6 +74,8 @@ impl BeatScheduler {
         self.force_first_click = false;
         self.pending_current_click = false;
         self.early_next_click_fired = false;
+        self.delayed_events.clear();
+        self.active_offset_ms = 0;
     }
 
     pub fn advance_frame(
@@ -82,6 +97,56 @@ impl BeatScheduler {
         self.phase %= subdivision_threshold;
         self.subdivision_index %= subdivisions_per_beat;
         let click_offset_ms = click_offset_ms.clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS);
+        if self.active_offset_ms != click_offset_ms {
+            self.delayed_events.clear();
+            self.pending_current_click = false;
+            self.early_next_click_fired = false;
+            self.active_offset_ms = click_offset_ms;
+        }
+
+        let event = if click_offset_ms > 0 {
+            if let Some(event) = self.advance_offset_core(
+                beats_per_bar,
+                subdivisions_per_beat,
+                subdivision_threshold,
+                0,
+            ) {
+                let due_frame = self
+                    .frame_index
+                    .saturating_add(self.offset_frames(click_offset_ms));
+                if self.delayed_events.len() == MAX_DELAYED_EVENTS {
+                    self.delayed_events.pop_front();
+                }
+                self.delayed_events.push_back((due_frame, event));
+            }
+            if self
+                .delayed_events
+                .front()
+                .is_some_and(|(due_frame, _)| *due_frame <= self.frame_index)
+            {
+                self.delayed_events.pop_front().map(|(_, event)| event)
+            } else {
+                None
+            }
+        } else {
+            self.advance_offset_core(
+                beats_per_bar,
+                subdivisions_per_beat,
+                subdivision_threshold,
+                click_offset_ms,
+            )
+        };
+        self.frame_index = self.frame_index.saturating_add(1);
+        event
+    }
+
+    fn advance_offset_core(
+        &mut self,
+        beats_per_bar: u8,
+        subdivisions_per_beat: u8,
+        subdivision_threshold: u64,
+        click_offset_ms: i32,
+    ) -> Option<BeatEvent> {
         let mut event = None;
 
         if self.force_first_click {
@@ -121,14 +186,24 @@ impl BeatScheduler {
                     ));
                 }
             } else {
-                let offset_phase = self
-                    .offset_phase(click_offset_ms.abs())
-                    .min(subdivision_threshold.saturating_sub(1));
-                let early_phase = subdivision_threshold - offset_phase.max(1);
-                if !self.early_next_click_fired && self.phase >= early_phase {
+                let offset_phase = self.offset_phase(click_offset_ms.abs());
+                let whole_intervals = offset_phase / subdivision_threshold;
+                let remaining_phase = offset_phase % subdivision_threshold;
+                let early_phase = if remaining_phase == 0 {
+                    subdivision_threshold.saturating_sub(1)
+                } else {
+                    subdivision_threshold - remaining_phase
+                };
+                let next_phase = self.phase.saturating_add(self.phase_increment);
+                if !self.early_next_click_fired
+                    && (self.phase >= early_phase || next_phase >= early_phase)
+                {
                     self.early_next_click_fired = true;
-                    let (beat_index, subdivision_index) =
-                        self.next_position(beats_per_bar, subdivisions_per_beat);
+                    let (beat_index, subdivision_index) = self.future_position(
+                        beats_per_bar,
+                        subdivisions_per_beat,
+                        whole_intervals.saturating_add(1),
+                    );
                     event = Some(self.event_for(
                         beat_index,
                         subdivision_index,
@@ -155,8 +230,12 @@ impl BeatScheduler {
     }
 
     fn offset_phase(&self, offset_ms: i32) -> u64 {
-        let frames = (u64::from(offset_ms.unsigned_abs()) * self.threshold) / 60_000_000;
-        (frames * self.phase_increment).min(self.threshold.saturating_sub(1))
+        self.offset_frames(offset_ms)
+            .saturating_mul(self.phase_increment)
+    }
+
+    fn offset_frames(&self, offset_ms: i32) -> u64 {
+        (u64::from(offset_ms.unsigned_abs()) * self.threshold) / 60_000_000
     }
 
     fn next_position(&self, beats_per_bar: u8, subdivisions_per_beat: u8) -> (u8, u8) {
@@ -166,6 +245,22 @@ impl BeatScheduler {
         } else {
             (self.beat_index, next_subdivision)
         }
+    }
+
+    fn future_position(
+        &self,
+        beats_per_bar: u8,
+        subdivisions_per_beat: u8,
+        steps: u64,
+    ) -> (u8, u8) {
+        let subdivisions_per_bar = u64::from(beats_per_bar) * u64::from(subdivisions_per_beat);
+        let current = u64::from(self.beat_index) * u64::from(subdivisions_per_beat)
+            + u64::from(self.subdivision_index);
+        let future = (current + steps) % subdivisions_per_bar;
+        (
+            (future / u64::from(subdivisions_per_beat)) as u8,
+            (future % u64::from(subdivisions_per_beat)) as u8,
+        )
     }
 
     fn event_for(
@@ -187,7 +282,31 @@ impl BeatScheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::BeatScheduler;
+    use super::{BeatEvent, BeatScheduler};
+
+    fn collect_events(
+        bpm_milli: u32,
+        beat_unit: u8,
+        subdivisions_per_beat: u8,
+        offset_ms: i32,
+        count: usize,
+    ) -> Vec<(u64, BeatEvent)> {
+        let mut scheduler = BeatScheduler::new(48_000);
+        scheduler.start();
+
+        let mut events = Vec::new();
+        for frame in 0..(48_000 * 60) {
+            if let Some(event) =
+                scheduler.advance_frame(bpm_milli, 4, beat_unit, subdivisions_per_beat, offset_ms)
+            {
+                events.push((frame, event));
+            }
+            if events.len() >= count {
+                break;
+            }
+        }
+        events
+    }
 
     fn collect_intervals(
         bpm_milli: u32,
@@ -195,23 +314,10 @@ mod tests {
         subdivisions_per_beat: u8,
         offset_ms: i32,
     ) -> Vec<u64> {
-        let mut scheduler = BeatScheduler::new(48_000);
-        scheduler.start();
-
-        let mut hits = Vec::new();
-        for frame in 0..(48_000 * 60) {
-            if scheduler
-                .advance_frame(bpm_milli, 4, beat_unit, subdivisions_per_beat, offset_ms)
-                .is_some()
-            {
-                hits.push(frame);
-            }
-            if hits.len() >= 16 {
-                break;
-            }
-        }
-
-        hits.windows(2).map(|pair| pair[1] - pair[0]).collect()
+        collect_events(bpm_milli, beat_unit, subdivisions_per_beat, offset_ms, 16)
+            .windows(2)
+            .map(|pair| pair[1].0 - pair[0].0)
+            .collect()
     }
 
     #[test]
@@ -292,6 +398,30 @@ mod tests {
                 "subdivision {subdivisions} stopped producing clicks"
             );
         }
+    }
+
+    #[test]
+    fn positive_offset_preserves_the_full_delay_across_subdivision_intervals() {
+        let on_grid = collect_events(120_000, 4, 8, 0, 12);
+        let delayed = collect_events(120_000, 4, 8, 100, 12);
+        assert_eq!(on_grid.len(), delayed.len());
+        for ((grid_frame, grid_event), (delayed_frame, delayed_event)) in
+            on_grid.iter().zip(&delayed)
+        {
+            assert_eq!(delayed_frame - grid_frame, 4_800);
+            assert_eq!(delayed_event, grid_event);
+        }
+    }
+
+    #[test]
+    fn negative_offset_advances_subdivision_identity_across_intervals() {
+        let early = collect_events(120_000, 4, 8, -100, 4);
+        assert_eq!(early[0].0, 0);
+        assert_eq!(early[0].1.subdivision_index, 0);
+        assert!(early[1].0.abs_diff(1_200) <= 1);
+        assert_eq!(early[1].1.subdivision_index, 2);
+        assert!(early[2].0.abs_diff(4_200) <= 1);
+        assert_eq!(early[2].1.subdivision_index, 3);
     }
 
     #[test]
