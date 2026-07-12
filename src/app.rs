@@ -6,8 +6,8 @@ use eframe::egui;
 use crate::audio::{AudioDiagnostics, AudioEngine, BeatEvent, validate_audio_file};
 use crate::config::{
     AppConfig, BPM_MAX, BPM_MIN, BpmPreset, BuiltinSound, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS,
-    CloseBehavior, Language, LanguageMode, MeterMode, OUTPUT_BOOST_DB_MAX, SoundConfig, ThemeMode,
-    load_config, save_config,
+    CloseBehavior, DRAG_SENSITIVITY_MAX, DRAG_SENSITIVITY_MIN, Language, LanguageMode, MeterMode,
+    OUTPUT_BOOST_DB_MAX, SoundConfig, ThemeMode, load_config, save_config,
 };
 use crate::fonts::install_japanese_font;
 use crate::menu::{MenuCommand, NativeMenu};
@@ -1111,12 +1111,59 @@ impl MetronomeApp {
         }
 
         ui.add_space(10.0);
+        self.show_control_sensitivity_preferences(ui, lang);
+
+        ui.add_space(10.0);
         self.show_background_preferences(ui, lang);
 
         ui.add_space(10.0);
         egui::CollapsingHeader::new(tr(lang, "診断", "Diagnostics"))
             .default_open(false)
             .show(ui, |ui| self.show_diagnostics(ui, lang));
+    }
+
+    fn show_control_sensitivity_preferences(&mut self, ui: &mut egui::Ui, lang: Language) {
+        let mut bpm_sensitivity = self.config.interaction.bpm_drag_sensitivity;
+        let mut time_signature_sensitivity =
+            self.config.interaction.time_signature_drag_sensitivity;
+
+        egui::Frame::group(ui.style())
+            .corner_radius(8.0)
+            .inner_margin(12.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(tr(lang, "操作感度", "Control sensitivity")).strong());
+                ui.add_space(6.0);
+                ui.add(
+                    egui::Slider::new(
+                        &mut bpm_sensitivity,
+                        DRAG_SENSITIVITY_MIN..=DRAG_SENSITIVITY_MAX,
+                    )
+                    .step_by(0.01)
+                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                    .text(tr(lang, "BPMドラッグ", "BPM drag")),
+                );
+                ui.add(
+                    egui::Slider::new(
+                        &mut time_signature_sensitivity,
+                        DRAG_SENSITIVITY_MIN..=DRAG_SENSITIVITY_MAX,
+                    )
+                    .step_by(0.01)
+                    .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
+                    .text(tr(lang, "拍子ドラッグ", "Time-signature drag")),
+                );
+            });
+
+        if (self.config.interaction.bpm_drag_sensitivity - bpm_sensitivity).abs() > f32::EPSILON
+            || (self.config.interaction.time_signature_drag_sensitivity
+                - time_signature_sensitivity)
+                .abs()
+                > f32::EPSILON
+        {
+            self.config.interaction.bpm_drag_sensitivity = bpm_sensitivity;
+            self.config.interaction.time_signature_drag_sensitivity = time_signature_sensitivity;
+            self.persist_config();
+        }
     }
 
     fn show_background_preferences(&mut self, ui: &mut egui::Ui, lang: Language) {
@@ -1909,7 +1956,7 @@ impl MetronomeApp {
                     editor_rect,
                     egui::DragValue::new(&mut bpm)
                         .range((BPM_MIN / 1_000)..=(BPM_MAX / 1_000))
-                        .speed(1)
+                        .speed(f64::from(self.config.interaction.bpm_drag_sensitivity))
                         .update_while_editing(false),
                 )
             })
@@ -1985,14 +2032,18 @@ impl MetronomeApp {
                     numerator_rect,
                     egui::DragValue::new(&mut beats_per_bar)
                         .range(1..=16)
-                        .speed(1)
+                        .speed(f64::from(
+                            self.config.interaction.time_signature_drag_sensitivity,
+                        ))
                         .update_while_editing(false),
                 );
                 let denominator_response = ui.put(
                     denominator_rect,
                     egui::DragValue::new(&mut beat_unit)
                         .range(2..=16)
-                        .speed(2)
+                        .speed(f64::from(
+                            self.config.interaction.time_signature_drag_sensitivity * 2.0,
+                        ))
                         .update_while_editing(false),
                 );
                 (numerator_response, denominator_response)

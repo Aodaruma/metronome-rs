@@ -11,6 +11,10 @@ pub const BPM_MAX: u32 = 1_000_000;
 pub const CLICK_OFFSET_MIN_MS: i32 = -200;
 pub const CLICK_OFFSET_MAX_MS: i32 = 200;
 pub const OUTPUT_BOOST_DB_MAX: f32 = 12.0;
+pub const BPM_DRAG_SENSITIVITY_DEFAULT: f32 = 1.0 / 3.0;
+pub const TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT: f32 = 0.1;
+pub const DRAG_SENSITIVITY_MIN: f32 = 0.05;
+pub const DRAG_SENSITIVITY_MAX: f32 = 2.0;
 const CONFIG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +32,7 @@ pub struct AppConfig {
     pub audio: AudioConfig,
     pub background: BackgroundConfig,
     pub shortcuts: ShortcutConfig,
+    pub interaction: InteractionConfig,
     pub appearance: AppearanceConfig,
 }
 
@@ -96,6 +101,13 @@ pub struct ShortcutConfig {
     pub toggle_playback: String,
     pub bpm_up: String,
     pub bpm_down: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InteractionConfig {
+    pub bpm_drag_sensitivity: f32,
+    pub time_signature_drag_sensitivity: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,6 +197,15 @@ impl Default for ShortcutConfig {
     }
 }
 
+impl Default for InteractionConfig {
+    fn default() -> Self {
+        Self {
+            bpm_drag_sensitivity: BPM_DRAG_SENSITIVITY_DEFAULT,
+            time_signature_drag_sensitivity: TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT,
+        }
+    }
+}
+
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
@@ -212,6 +233,7 @@ impl Default for AppConfig {
             audio: AudioConfig::default(),
             background: BackgroundConfig::default(),
             shortcuts: ShortcutConfig::default(),
+            interaction: InteractionConfig::default(),
             appearance: AppearanceConfig::default(),
         }
     }
@@ -273,6 +295,14 @@ impl AppConfig {
         self.shortcuts.toggle_playback = self.shortcuts.toggle_playback.trim().to_owned();
         self.shortcuts.bpm_up = self.shortcuts.bpm_up.trim().to_owned();
         self.shortcuts.bpm_down = self.shortcuts.bpm_down.trim().to_owned();
+        self.interaction.bpm_drag_sensitivity = sanitize_drag_sensitivity(
+            self.interaction.bpm_drag_sensitivity,
+            BPM_DRAG_SENSITIVITY_DEFAULT,
+        );
+        self.interaction.time_signature_drag_sensitivity = sanitize_drag_sensitivity(
+            self.interaction.time_signature_drag_sensitivity,
+            TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT,
+        );
         self.schema_version = CONFIG_SCHEMA_VERSION;
     }
 
@@ -296,6 +326,14 @@ impl AppConfig {
             next_id = next_id.saturating_add(1);
             self.presets.push(preset);
         }
+    }
+}
+
+fn sanitize_drag_sensitivity(value: f32, default: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(DRAG_SENSITIVITY_MIN, DRAG_SENSITIVITY_MAX)
+    } else {
+        default
     }
 }
 
@@ -376,7 +414,11 @@ pub fn save_config(config: &AppConfig) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, BPM_MAX, BpmPreset, BuiltinSound, LanguageMode, OUTPUT_BOOST_DB_MAX};
+    use super::{
+        AppConfig, BPM_DRAG_SENSITIVITY_DEFAULT, BPM_MAX, BpmPreset, BuiltinSound,
+        DRAG_SENSITIVITY_MAX, LanguageMode, OUTPUT_BOOST_DB_MAX,
+        TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT,
+    };
 
     #[test]
     fn config_without_language_uses_system_default() {
@@ -459,6 +501,31 @@ mod tests {
         config.sanitize();
         assert_eq!(config.audio.output_boost_db, 0.0);
         assert_eq!(config.audio.subdivision, 8);
+    }
+
+    #[test]
+    fn drag_sensitivities_are_sanitized() {
+        let mut config = AppConfig::default();
+        assert_eq!(
+            config.interaction.bpm_drag_sensitivity,
+            BPM_DRAG_SENSITIVITY_DEFAULT
+        );
+        assert_eq!(
+            config.interaction.time_signature_drag_sensitivity,
+            TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT
+        );
+
+        config.interaction.bpm_drag_sensitivity = f32::NAN;
+        config.interaction.time_signature_drag_sensitivity = 99.0;
+        config.sanitize();
+        assert_eq!(
+            config.interaction.bpm_drag_sensitivity,
+            BPM_DRAG_SENSITIVITY_DEFAULT
+        );
+        assert_eq!(
+            config.interaction.time_signature_drag_sensitivity,
+            DRAG_SENSITIVITY_MAX
+        );
     }
 
     #[test]
