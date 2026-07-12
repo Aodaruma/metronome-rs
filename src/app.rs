@@ -5,8 +5,8 @@ use eframe::egui;
 
 use crate::audio::{AudioDiagnostics, AudioEngine, BeatEvent, validate_audio_file};
 use crate::config::{
-    AppConfig, BPM_MAX, BPM_MIN, BPM_SOFT_MAX, BpmPreset, BuiltinSound, CLICK_OFFSET_MAX_MS,
-    CLICK_OFFSET_MIN_MS, CloseBehavior, Language, LanguageMode, MeterMode, SoundConfig, ThemeMode,
+    AppConfig, BPM_MAX, BPM_MIN, BpmPreset, BuiltinSound, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS,
+    CloseBehavior, Language, LanguageMode, MeterMode, OUTPUT_BOOST_DB_MAX, SoundConfig, ThemeMode,
     load_config, save_config,
 };
 use crate::fonts::install_japanese_font;
@@ -17,10 +17,22 @@ use crate::shortcuts::{
 };
 use crate::theme;
 
+const PRESET_SIDEBAR_WIDTH: f32 = 310.0;
+const PRESET_SIDEBAR_GAP: f32 = 16.0;
+const ARC_START_ANGLE: f32 = std::f32::consts::FRAC_PI_2 * 1.5;
+const ARC_SWEEP_ANGLE: f32 = std::f32::consts::TAU * 0.75;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTab {
     Metronome,
     Preferences,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SoundKind {
+    Normal,
+    Accent,
+    Subdivision,
 }
 
 pub struct MetronomeApp {
@@ -37,8 +49,10 @@ pub struct MetronomeApp {
     last_beat: Option<BeatEvent>,
     last_beat_time: f64,
     last_accent_time: f64,
+    last_primary_beat_time: f64,
+    arc_at_end: bool,
     preset_name_draft: String,
-    presets_window_open: bool,
+    presets_sidebar_open: bool,
     about_window_open: bool,
     window_visible: bool,
     force_exit: bool,
@@ -88,8 +102,10 @@ impl MetronomeApp {
             last_beat: None,
             last_beat_time: 0.0,
             last_accent_time: -1.0,
+            last_primary_beat_time: -1.0,
+            arc_at_end: false,
             preset_name_draft: String::new(),
-            presets_window_open: false,
+            presets_sidebar_open: false,
             about_window_open: false,
             window_visible: !start_hidden,
             force_exit: false,
@@ -134,6 +150,10 @@ impl MetronomeApp {
         for event in audio.poll_events() {
             self.last_beat = Some(event.beat);
             self.last_beat_time = now;
+            if event.beat.subdivision_index == 0 {
+                self.last_primary_beat_time = now;
+                self.arc_at_end = !self.arc_at_end;
+            }
             if event.beat.is_accent {
                 self.last_accent_time = now;
             }
@@ -189,8 +209,8 @@ impl MetronomeApp {
     fn handle_menu_command(&mut self, command: MenuCommand, ctx: &egui::Context) {
         match command {
             MenuCommand::SaveSettings => self.persist_config(),
-            MenuCommand::ChooseNormalSound => self.choose_sound_file(false),
-            MenuCommand::ChooseAccentSound => self.choose_sound_file(true),
+            MenuCommand::ChooseNormalSound => self.choose_sound_file(SoundKind::Normal),
+            MenuCommand::ChooseAccentSound => self.choose_sound_file(SoundKind::Accent),
             MenuCommand::ResetSounds => self.reset_all_sound_files(),
             MenuCommand::Quit => self.quit(ctx),
             MenuCommand::TogglePlayback => self.toggle_running(),
@@ -223,7 +243,7 @@ impl MetronomeApp {
             MenuCommand::SavePreset => self.save_current_preset(),
             MenuCommand::ShowPresets => {
                 self.tab = AppTab::Metronome;
-                self.presets_window_open = true;
+                self.set_presets_sidebar_open(ctx, true);
             }
             MenuCommand::ShowMetronome => self.tab = AppTab::Metronome,
             MenuCommand::ShowPreferences => self.tab = AppTab::Preferences,
@@ -284,7 +304,7 @@ impl MetronomeApp {
         }
         self.config.volume_percent = next;
         if let Some(audio) = &self.audio {
-            audio.set_volume_percent(next);
+            audio.set_output_level(next, self.config.audio.output_boost_db);
         }
         self.persist_config();
     }
@@ -325,12 +345,77 @@ impl MetronomeApp {
         self.persist_config();
     }
 
+    fn set_output_boost_db(&mut self, output_boost_db: f32) {
+        let next = output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX);
+        if (self.config.audio.output_boost_db - next).abs() < f32::EPSILON {
+            return;
+        }
+        self.config.audio.output_boost_db = next;
+        if let Some(audio) = &self.audio {
+            audio.set_output_level(self.config.volume_percent, next);
+        }
+        self.persist_config();
+    }
+
+    fn set_subdivision(&mut self, subdivision: u8) {
+        let next = subdivision.clamp(1, 8);
+        if self.config.audio.subdivision == next {
+            return;
+        }
+        self.config.audio.subdivision = next;
+        if let Some(audio) = &self.audio {
+            audio.set_subdivision(next);
+        }
+        self.persist_config();
+    }
+
+    fn set_accent_enabled(&mut self, enabled: bool) {
+        if self.config.sound.accent_enabled == enabled {
+            return;
+        }
+        self.config.sound.accent_enabled = enabled;
+        if let Some(audio) = &self.audio {
+            audio.set_accent_enabled(enabled);
+        }
+        self.persist_config();
+    }
+
     fn set_meter_mode(&mut self, meter_mode: MeterMode) {
         if self.config.meter_mode == meter_mode {
             return;
         }
         self.config.meter_mode = meter_mode;
         self.persist_config();
+    }
+
+    fn set_presets_sidebar_open(&mut self, ctx: &egui::Context, open: bool) {
+        if self.presets_sidebar_open == open {
+            return;
+        }
+        self.presets_sidebar_open = open;
+
+        let min_width = if open {
+            420.0 + PRESET_SIDEBAR_WIDTH + PRESET_SIDEBAR_GAP
+        } else {
+            420.0
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+            min_width, 560.0,
+        )));
+
+        let current_size = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
+        if let Some(current_size) = current_size {
+            let width_delta = PRESET_SIDEBAR_WIDTH + PRESET_SIDEBAR_GAP;
+            let next_width = if open {
+                current_size.x + width_delta
+            } else {
+                (current_size.x - width_delta).max(420.0)
+            };
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                next_width,
+                current_size.y,
+            )));
+        }
     }
 
     fn set_theme(&mut self, ctx: &egui::Context, theme: ThemeMode) {
@@ -406,7 +491,7 @@ impl MetronomeApp {
         self.persist_config();
     }
 
-    fn choose_sound_file(&mut self, accent: bool) {
+    fn choose_sound_file(&mut self, kind: SoundKind) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Audio", &["wav", "flac", "mp3", "ogg"])
             .pick_file()
@@ -419,39 +504,51 @@ impl MetronomeApp {
             return;
         }
 
-        if accent {
-            self.config.sound.accent_path = Some(path);
-        } else {
-            self.config.sound.normal_path = Some(path);
+        match kind {
+            SoundKind::Normal => self.config.sound.normal_path = Some(path),
+            SoundKind::Accent => self.config.sound.accent_path = Some(path),
+            SoundKind::Subdivision => self.config.sound.subdivision_path = Some(path),
         }
         self.persist_config();
         self.rebuild_audio_engine();
     }
 
-    fn reset_sound_file(&mut self, accent: bool) {
-        if accent {
-            self.config.sound.accent_path = None;
-        } else {
-            self.config.sound.normal_path = None;
+    fn reset_sound_file(&mut self, kind: SoundKind) {
+        match kind {
+            SoundKind::Normal => self.config.sound.normal_path = None,
+            SoundKind::Accent => self.config.sound.accent_path = None,
+            SoundKind::Subdivision => self.config.sound.subdivision_path = None,
         }
         self.persist_config();
         self.rebuild_audio_engine();
     }
 
-    fn set_builtin_sound(&mut self, accent: bool, sound: BuiltinSound) {
-        if accent {
-            self.config.sound.accent_builtin = sound;
-            self.config.sound.accent_path = None;
-        } else {
-            self.config.sound.normal_builtin = sound;
-            self.config.sound.normal_path = None;
+    fn set_builtin_sound(&mut self, kind: SoundKind, sound: Option<BuiltinSound>) {
+        match kind {
+            SoundKind::Normal => {
+                let Some(sound) = sound else { return };
+                self.config.sound.normal_builtin = sound;
+                self.config.sound.normal_path = None;
+            }
+            SoundKind::Accent => {
+                let Some(sound) = sound else { return };
+                self.config.sound.accent_builtin = sound;
+                self.config.sound.accent_path = None;
+            }
+            SoundKind::Subdivision => {
+                self.config.sound.subdivision_builtin = sound;
+                self.config.sound.subdivision_path = None;
+            }
         }
         self.persist_config();
         self.rebuild_audio_engine();
     }
 
     fn reset_all_sound_files(&mut self) {
-        self.config.sound = SoundConfig::default();
+        self.config.sound = SoundConfig {
+            accent_enabled: self.config.sound.accent_enabled,
+            ..SoundConfig::default()
+        };
         self.persist_config();
         self.rebuild_audio_engine();
     }
@@ -800,7 +897,11 @@ impl MetronomeApp {
         let pulse = self.pulse_amount(ctx);
         let accent_pulse = self.accent_pulse_amount(ctx);
         match self.config.meter_mode {
-            MeterMode::Arc => self.show_arc_meter(ui, meter_size, pulse, accent_pulse),
+            MeterMode::Arc => {
+                let motion_ratio = self.arc_motion_ratio(ctx);
+                let endpoint_pop = self.arc_endpoint_pop_amount(ctx);
+                self.show_arc_meter(ui, meter_size, accent_pulse, motion_ratio, endpoint_pop);
+            }
             MeterMode::Circle => self.show_circle_meter(ui, meter_size, pulse, accent_pulse),
         }
     }
@@ -920,8 +1021,12 @@ impl MetronomeApp {
         let lang = self.language();
         ui.add_space(10.0);
         let mut volume = i32::from(self.config.volume_percent);
+        let mut output_boost_db = self.config.audio.output_boost_db;
         let mut offset_ms = self.config.audio.click_timing_offset_ms;
+        let mut subdivision = self.config.audio.subdivision;
+        let mut accent_enabled = self.config.sound.accent_enabled;
         let mut volume_changed = false;
+        let mut boost_changed = false;
         egui::Frame::group(ui.style())
             .corner_radius(8.0)
             .inner_margin(12.0)
@@ -936,10 +1041,32 @@ impl MetronomeApp {
                         "Volume (%)",
                     )))
                     .changed();
+                boost_changed = ui
+                    .add(
+                        egui::Slider::new(&mut output_boost_db, 0.0..=OUTPUT_BOOST_DB_MAX)
+                            .step_by(0.5)
+                            .suffix(" dB")
+                            .text(tr(lang, "音量ブースト", "Volume boost")),
+                    )
+                    .on_hover_text(tr(
+                        lang,
+                        "元の音量を最大 +12 dB まで増幅します。音割れする場合は下げてください。",
+                        "Boosts the source by up to +12 dB. Reduce it if clipping occurs.",
+                    ))
+                    .changed();
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new(tr(lang, "クリック音", "Click sounds")).strong());
-                self.show_sound_file_row(ui, lang, false);
-                self.show_sound_file_row(ui, lang, true);
+                ui.checkbox(
+                    &mut accent_enabled,
+                    tr(
+                        lang,
+                        "小節先頭にアクセント音を追加",
+                        "Use an accent sound at the start of each bar",
+                    ),
+                );
+                self.show_sound_file_row(ui, lang, SoundKind::Normal);
+                self.show_sound_file_row(ui, lang, SoundKind::Accent);
+                self.show_sound_file_row(ui, lang, SoundKind::Subdivision);
                 ui.add_space(8.0);
                 ui.separator();
                 let response = ui.add(
@@ -951,12 +1078,36 @@ impl MetronomeApp {
                     "負の値で音源を拍より前倒し、正の値で遅らせます。",
                     "Negative values play before the beat; positive values play later.",
                 ));
+                ui.horizontal(|ui| {
+                    ui.label(tr(lang, "Subdivision", "Subdivision"));
+                    egui::ComboBox::from_id_salt("settings_subdivision")
+                        .selected_text(subdivision_label(lang, subdivision))
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for value in 1..=8 {
+                                ui.selectable_value(
+                                    &mut subdivision,
+                                    value,
+                                    subdivision_label(lang, value),
+                                );
+                            }
+                        });
+                });
             });
         if volume_changed {
             self.set_volume_percent(volume as u8);
         }
+        if boost_changed {
+            self.set_output_boost_db(output_boost_db);
+        }
         if offset_ms != self.config.audio.click_timing_offset_ms {
             self.set_click_offset_ms(offset_ms);
+        }
+        if subdivision != self.config.audio.subdivision {
+            self.set_subdivision(subdivision);
+        }
+        if accent_enabled != self.config.sound.accent_enabled {
+            self.set_accent_enabled(accent_enabled);
         }
 
         ui.add_space(10.0);
@@ -1171,38 +1322,52 @@ impl MetronomeApp {
         }
     }
 
-    fn show_sound_file_row(&mut self, ui: &mut egui::Ui, lang: Language, accent: bool) {
-        let selected_path: Option<PathBuf> = if accent {
-            self.config.sound.accent_path.clone()
-        } else {
-            self.config.sound.normal_path.clone()
+    fn show_sound_file_row(&mut self, ui: &mut egui::Ui, lang: Language, kind: SoundKind) {
+        let selected_path: Option<PathBuf> = match kind {
+            SoundKind::Normal => self.config.sound.normal_path.clone(),
+            SoundKind::Accent => self.config.sound.accent_path.clone(),
+            SoundKind::Subdivision => self.config.sound.subdivision_path.clone(),
         };
-        let label = if accent {
-            tr(lang, "アクセント", "Accent")
-        } else {
-            tr(lang, "通常音", "Normal")
+        let label = match kind {
+            SoundKind::Normal => tr(lang, "通常音", "Normal"),
+            SoundKind::Accent => tr(lang, "アクセント", "Accent"),
+            SoundKind::Subdivision => "Subdivision",
         };
-        let selected_builtin = if accent {
-            self.config.sound.accent_builtin
-        } else {
-            self.config.sound.normal_builtin
+        let selected_builtin = match kind {
+            SoundKind::Normal => Some(self.config.sound.normal_builtin),
+            SoundKind::Accent => Some(self.config.sound.accent_builtin),
+            SoundKind::Subdivision => self.config.sound.subdivision_builtin,
         };
         let display_name = selected_path
             .as_deref()
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
-            .unwrap_or(builtin_sound_label(selected_builtin));
+            .unwrap_or_else(|| {
+                selected_builtin.map_or_else(
+                    || tr(lang, "通常音を使用", "Use normal sound"),
+                    builtin_sound_label,
+                )
+            });
         let mut builtin = selected_builtin;
         let mut builtin_changed = false;
         let mut choose_clicked = false;
         let mut reset_clicked = false;
 
         ui.horizontal(|ui| {
-            ui.add_sized([72.0, 24.0], egui::Label::new(label));
-            let combo = egui::ComboBox::from_id_salt(("builtin_sound", accent))
+            ui.add_sized([96.0, 24.0], egui::Label::new(label));
+            let combo = egui::ComboBox::from_id_salt(("builtin_sound", kind))
                 .selected_text(display_name)
                 .width(120.0)
                 .show_ui(ui, |ui| {
+                    if kind == SoundKind::Subdivision {
+                        builtin_changed |= ui
+                            .selectable_value(
+                                &mut builtin,
+                                None,
+                                tr(lang, "通常音を使用", "Use normal sound"),
+                            )
+                            .changed();
+                    }
                     for value in [
                         BuiltinSound::Sin1,
                         BuiltinSound::Sin2,
@@ -1210,7 +1375,7 @@ impl MetronomeApp {
                         BuiltinSound::Sin4,
                     ] {
                         builtin_changed |= ui
-                            .selectable_value(&mut builtin, value, builtin_sound_label(value))
+                            .selectable_value(&mut builtin, Some(value), builtin_sound_label(value))
                             .changed();
                     }
                 });
@@ -1228,17 +1393,25 @@ impl MetronomeApp {
             reset_clicked = ui
                 .add_enabled(
                     selected_path.is_some(),
-                    egui::Button::new(tr(lang, "内蔵に戻す", "Use built-in")),
+                    egui::Button::new(match kind {
+                        SoundKind::Subdivision if selected_builtin.is_none() => {
+                            tr(lang, "通常音に戻す", "Use normal")
+                        }
+                        SoundKind::Subdivision => tr(lang, "内蔵に戻す", "Use built-in"),
+                        SoundKind::Normal | SoundKind::Accent => {
+                            tr(lang, "内蔵に戻す", "Use built-in")
+                        }
+                    }),
                 )
                 .clicked();
         });
 
         if builtin_changed {
-            self.set_builtin_sound(accent, builtin);
+            self.set_builtin_sound(kind, builtin);
         } else if choose_clicked {
-            self.choose_sound_file(accent);
+            self.choose_sound_file(kind);
         } else if reset_clicked {
-            self.reset_sound_file(accent);
+            self.reset_sound_file(kind);
         }
     }
 
@@ -1318,6 +1491,30 @@ impl MetronomeApp {
         }
     }
 
+    fn arc_motion_ratio(&self, ctx: &egui::Context) -> f32 {
+        if self.last_primary_beat_time < 0.0 {
+            return 0.5;
+        }
+        let beat_unit = f64::from(self.config.time_signature.beat_unit.max(1));
+        let beat_interval_seconds =
+            60_000.0 / f64::from(self.config.bpm_milli.max(1)) * 4.0 / beat_unit;
+        let now = ctx.input(|input| input.time);
+        arc_motion_position(
+            self.is_running(),
+            self.arc_at_end,
+            (now - self.last_primary_beat_time).max(0.0),
+            beat_interval_seconds,
+        )
+    }
+
+    fn arc_endpoint_pop_amount(&self, ctx: &egui::Context) -> f32 {
+        if !self.is_running() || self.last_primary_beat_time < 0.0 {
+            return 0.0;
+        }
+        let now = ctx.input(|input| input.time);
+        arc_endpoint_pop((now - self.last_primary_beat_time).max(0.0))
+    }
+
     fn show_meter_toolbar(&mut self, ui: &mut egui::Ui, meter_rect: egui::Rect) {
         let lang = self.language();
         let button_size = egui::vec2(40.0, 40.0);
@@ -1348,14 +1545,22 @@ impl MetronomeApp {
             meter_rect.right_top() + egui::vec2(-25.0, 25.0),
             button_size,
         );
-        let preset_button = flat_round_icon_button_at(
+        let preset_tooltip = if self.presets_sidebar_open {
+            tr(lang, "BPMプリセットを閉じる", "Close BPM presets")
+        } else {
+            tr(lang, "BPMプリセットを開く", "Open BPM presets")
+        };
+        if flat_round_icon_button_at(
             ui,
             preset_rect,
-            "preset_menu_button",
+            "preset_sidebar_button",
             MaterialIcon::Presets,
-            tr(lang, "BPMプリセット", "BPM presets"),
-        );
-        self.show_preset_popup(ui, &preset_button);
+            preset_tooltip,
+        )
+        .clicked()
+        {
+            self.set_presets_sidebar_open(ui.ctx(), !self.presets_sidebar_open);
+        }
     }
 
     fn show_playback_button_at(&mut self, ui: &mut egui::Ui, center: egui::Pos2) {
@@ -1374,14 +1579,33 @@ impl MetronomeApp {
         }
     }
 
-    fn show_preset_popup(&mut self, ui: &mut egui::Ui, button_response: &egui::Response) {
-        egui::Popup::menu(button_response)
-            .id(ui.make_persistent_id("bpm_preset_popup"))
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .show(|ui| {
-                ui.set_min_width(270.0);
-                self.show_preset_contents(ui);
+    fn show_preset_sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let lang = self.language();
+        let mut close_clicked = false;
+        egui::Frame::group(ui.style())
+            .corner_radius(8.0)
+            .inner_margin(12.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.heading(tr(lang, "BPMプリセット", "BPM presets"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close_clicked = ui
+                            .button("×")
+                            .on_hover_text(tr(lang, "閉じる", "Close"))
+                            .clicked();
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("preset_sidebar_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.show_preset_contents(ui));
             });
+
+        if close_clicked {
+            self.set_presets_sidebar_open(ctx, false);
+        }
     }
 
     fn show_preset_contents(&mut self, ui: &mut egui::Ui) {
@@ -1391,7 +1615,6 @@ impl MetronomeApp {
         let mut load_id = None;
         let mut delete_id = None;
 
-        ui.label(egui::RichText::new(tr(lang, "BPMプリセット", "BPM presets")).strong());
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut self.preset_name_draft)
@@ -1448,18 +1671,6 @@ impl MetronomeApp {
     }
 
     fn show_auxiliary_windows(&mut self, ctx: &egui::Context) {
-        if self.presets_window_open {
-            let lang = self.language();
-            let mut open = self.presets_window_open;
-            egui::Window::new(tr(lang, "プリセット管理", "Manage presets"))
-                .open(&mut open)
-                .resizable(false)
-                .collapsible(false)
-                .default_width(310.0)
-                .show(ctx, |ui| self.show_preset_contents(ui));
-            self.presets_window_open = open;
-        }
-
         if self.about_window_open {
             let lang = self.language();
             let mut open = self.about_window_open;
@@ -1484,82 +1695,78 @@ impl MetronomeApp {
         }
     }
 
-    fn show_arc_meter(&mut self, ui: &mut egui::Ui, size: f32, pulse: f32, accent_pulse: f32) {
+    fn show_main_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.show_tabs(ui, ctx);
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("main_content")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                match self.tab {
+                    AppTab::Metronome => self.show_metronome(ui, ctx),
+                    AppTab::Preferences => self.show_preferences(ui, ctx),
+                }
+                self.show_status(ui);
+            });
+    }
+
+    fn show_arc_meter(
+        &mut self,
+        ui: &mut egui::Ui,
+        size: f32,
+        accent_pulse: f32,
+        motion_ratio: f32,
+        endpoint_pop: f32,
+    ) {
         let (rect, response) = centered_row(ui, size, size, |ui| {
-            ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::click_and_drag())
+            ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover())
         })
         .inner;
-        let response = response.on_hover_text(tr(
+        response.on_hover_text(tr(
             self.language(),
-            "円弧をクリックまたはドラッグしてBPMを変更",
-            "Click or drag the arc to change BPM",
+            "拍に合わせて左右へ往復します",
+            "Moves back and forth with each beat",
         ));
 
         let center = rect.center() + egui::vec2(0.0, -4.0);
         let base_radius = rect.width().min(rect.height()) * 0.40;
-        let radius = base_radius * (1.0 + pulse * 0.018);
-        let start_angle = std::f32::consts::FRAC_PI_2 * 1.5;
-        let sweep_angle = std::f32::consts::TAU * 0.75;
-
-        if (response.clicked() || response.dragged())
-            && let Some(pointer) = response.interact_pointer_pos()
-        {
-            let distance = pointer.distance(center);
-            if (base_radius * 0.64..=base_radius * 1.18).contains(&distance) {
-                let ratio = arc_ratio_from_pointer(pointer, center, start_angle, sweep_angle);
-                let bpm = egui::lerp(
-                    (BPM_MIN / 1_000) as f32..=(BPM_SOFT_MAX / 1_000) as f32,
-                    ratio,
-                )
-                .round() as u32;
-                self.set_bpm_milli(bpm * 1_000);
-            }
-        }
+        let radius = base_radius;
+        let start_angle = ARC_START_ANGLE;
+        let sweep_angle = ARC_SWEEP_ANGLE;
 
         let visuals = ui.visuals().clone();
         let painter = ui.painter_at(rect);
-        let bpm_ratio = ((self.config.bpm_milli.saturating_sub(BPM_MIN)) as f32
-            / (BPM_SOFT_MAX - BPM_MIN) as f32)
-            .clamp(0.0, 1.0);
         let active_color = visuals.selection.bg_fill;
 
         painter.add(egui::Shape::line(
-            arc_points(center, radius, start_angle, sweep_angle, 72),
-            egui::Stroke::new(12.0, visuals.widgets.inactive.bg_fill),
+            arc_points(center, radius, start_angle, sweep_angle, 36),
+            egui::Stroke::new(7.0, visuals.widgets.inactive.bg_fill),
         ));
-        painter.add(egui::Shape::line(
-            arc_points(
-                center,
-                radius,
-                start_angle,
-                sweep_angle * bpm_ratio.max(0.002),
-                ((72.0 * bpm_ratio).ceil() as usize).max(1),
-            ),
-            egui::Stroke::new(12.0 + pulse * 2.0, active_color),
-        ));
-
-        for index in 0..=8 {
-            let ratio = index as f32 / 8.0;
+        for ratio in [0.0_f32, 0.5, 1.0] {
             let angle = start_angle + sweep_angle * ratio;
-            let inner = point_on_arc(center, radius - 14.0, angle);
-            let outer = point_on_arc(center, radius + 14.0, angle);
-            painter.line_segment(
-                [inner, outer],
-                egui::Stroke::new(
-                    if index % 2 == 0 { 2.0 } else { 1.0 },
-                    visuals.weak_text_color(),
-                ),
+            let marker = point_on_arc(center, radius, angle);
+            painter.circle_filled(
+                marker,
+                if ratio == 0.5 { 3.5 } else { 5.0 },
+                visuals.widgets.inactive.bg_fill,
             );
         }
 
-        let knob_angle = start_angle + sweep_angle * bpm_ratio;
-        let knob = point_on_arc(center, radius, knob_angle);
-        painter.circle_filled(knob, 9.0 + pulse * 2.0, active_color);
-        painter.circle_stroke(
-            knob,
-            11.0 + pulse * 2.0,
-            egui::Stroke::new(2.0, visuals.extreme_bg_color),
-        );
+        let motion_angle = start_angle + sweep_angle * motion_ratio.clamp(0.0, 1.0);
+        let motion_marker = point_on_arc(center, radius, motion_angle);
+        if self.is_running() {
+            let motion_direction = if self.arc_at_end { -1.0 } else { 1.0 };
+            paint_arc_motion_trail(
+                &painter,
+                center,
+                radius,
+                start_angle,
+                sweep_angle,
+                motion_ratio,
+                motion_direction,
+                active_color,
+            );
+        }
 
         let plate_radius = base_radius * 0.61;
         let plate_fill = theme::central_plate_color(
@@ -1578,6 +1785,13 @@ impl MetronomeApp {
             egui::Stroke::new(1.0, visuals.widgets.inactive.bg_stroke.color),
         );
         paint_accent_ring(&painter, center, plate_radius, accent_pulse, active_color);
+        let marker_pop = endpoint_pop * 6.0;
+        painter.circle_filled(motion_marker, 10.0 + marker_pop, active_color);
+        painter.circle_stroke(
+            motion_marker,
+            12.0 + marker_pop,
+            egui::Stroke::new(2.0, visuals.extreme_bg_color),
+        );
         painter.text(
             center + egui::vec2(0.0, -54.0),
             egui::Align2::CENTER_CENTER,
@@ -1838,6 +2052,46 @@ fn paint_accent_ring(
         plate_radius + 4.0 + expansion,
         egui::Stroke::new(2.0 + pulse * 4.0, color),
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_arc_motion_trail(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    start_angle: f32,
+    sweep_angle: f32,
+    motion_ratio: f32,
+    motion_direction: f32,
+    color: egui::Color32,
+) {
+    const TRAIL_LENGTH: f32 = 0.6;
+    const TRAIL_SEGMENTS: usize = 12;
+
+    for index in (0..TRAIL_SEGMENTS).rev() {
+        let near_distance = index as f32 / TRAIL_SEGMENTS as f32 * TRAIL_LENGTH;
+        let far_distance = (index + 1) as f32 / TRAIL_SEGMENTS as f32 * TRAIL_LENGTH;
+        let near_ratio = (motion_ratio - motion_direction * near_distance).clamp(0.0, 1.0);
+        let far_ratio = (motion_ratio - motion_direction * far_distance).clamp(0.0, 1.0);
+        if (near_ratio - far_ratio).abs() <= f32::EPSILON {
+            continue;
+        }
+
+        let strength = 1.0 - index as f32 / TRAIL_SEGMENTS as f32;
+        let alpha = (f32::from(color.a()) * 0.72 * strength.powf(1.4)).round() as u8;
+        let trail_color =
+            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+        painter.add(egui::Shape::line(
+            arc_points(
+                center,
+                radius,
+                start_angle + sweep_angle * far_ratio,
+                sweep_angle * (near_ratio - far_ratio),
+                3,
+            ),
+            egui::Stroke::new(2.0 + 6.0 * strength, trail_color),
+        ));
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2123,25 +2377,23 @@ fn arc_points(
         .collect()
 }
 
-fn arc_ratio_from_pointer(
-    pointer: egui::Pos2,
-    center: egui::Pos2,
-    start_angle: f32,
-    sweep_angle: f32,
+fn arc_motion_position(
+    running: bool,
+    at_end: bool,
+    elapsed_seconds: f64,
+    beat_interval_seconds: f64,
 ) -> f32 {
-    let pointer_angle = (pointer.y - center.y).atan2(pointer.x - center.x);
-    let delta = (pointer_angle - start_angle).rem_euclid(std::f32::consts::TAU);
-    if delta <= sweep_angle {
-        delta / sweep_angle
-    } else {
-        let distance_to_start = std::f32::consts::TAU - delta;
-        let distance_to_end = delta - sweep_angle;
-        if distance_to_start < distance_to_end {
-            0.0
-        } else {
-            1.0
-        }
+    if !running || !beat_interval_seconds.is_finite() || beat_interval_seconds <= 0.0 {
+        return 0.5;
     }
+    let progress = (elapsed_seconds / beat_interval_seconds).clamp(0.0, 1.0) as f32;
+    if at_end { 1.0 - progress } else { progress }
+}
+
+fn arc_endpoint_pop(elapsed_seconds: f64) -> f32 {
+    const POP_DURATION_SECONDS: f64 = 0.14;
+    let progress = (elapsed_seconds / POP_DURATION_SECONDS).clamp(0.0, 1.0) as f32;
+    (1.0 - progress).powi(2)
 }
 
 impl eframe::App for MetronomeApp {
@@ -2164,18 +2416,27 @@ impl eframe::App for MetronomeApp {
                 self.show_menu(ui, &ctx);
                 ui.separator();
             }
-            self.show_tabs(ui, &ctx);
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .id_salt("main_content")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    match self.tab {
-                        AppTab::Metronome => self.show_metronome(ui, &ctx),
-                        AppTab::Preferences => self.show_preferences(ui, &ctx),
-                    }
-                    self.show_status(ui);
+            if self.presets_sidebar_open {
+                let available_width = ui.available_width();
+                let available_height = ui.available_height();
+                let main_width =
+                    (available_width - PRESET_SIDEBAR_WIDTH - PRESET_SIDEBAR_GAP).max(260.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(main_width, available_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| self.show_main_content(ui, &ctx),
+                    );
+                    ui.add_space(PRESET_SIDEBAR_GAP);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(PRESET_SIDEBAR_WIDTH, available_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| self.show_preset_sidebar(ui, &ctx),
+                    );
                 });
+            } else {
+                self.show_main_content(ui, &ctx);
+            }
         });
         self.show_auxiliary_windows(&ctx);
 
@@ -2232,6 +2493,14 @@ fn meter_mode_label(lang: Language, mode: MeterMode) -> &'static str {
     }
 }
 
+fn subdivision_label(lang: Language, subdivision: u8) -> String {
+    if subdivision <= 1 {
+        tr(lang, "オフ", "Off").to_owned()
+    } else {
+        format!("×{}", subdivision.clamp(2, 8))
+    }
+}
+
 fn close_behavior_label(lang: Language, behavior: CloseBehavior) -> &'static str {
     match behavior {
         CloseBehavior::Exit => tr(lang, "アプリを終了", "Exit the app"),
@@ -2279,21 +2548,35 @@ fn diagnostics_grid(ui: &mut egui::Ui, lang: Language, diagnostics: AudioDiagnos
 
 #[cfg(test)]
 mod tests {
-    use super::{arc_ratio_from_pointer, normalize_beat_unit, point_on_arc, unique_preset_name};
+    use super::{
+        ARC_SWEEP_ANGLE, arc_endpoint_pop, arc_motion_position, normalize_beat_unit,
+        unique_preset_name,
+    };
     use crate::config::BpmPreset;
-    use eframe::egui;
 
     #[test]
-    fn arc_pointer_mapping_matches_endpoints_and_midpoint() {
-        let center = egui::pos2(100.0, 100.0);
-        let start = std::f32::consts::FRAC_PI_2 * 1.5;
-        let sweep = std::f32::consts::TAU * 0.75;
+    fn arc_motion_moves_linearly_and_centers_when_stopped() {
+        assert_eq!(arc_motion_position(false, false, 0.0, 0.5), 0.5);
+        assert!((arc_motion_position(true, false, 0.0, 0.5) - 0.0).abs() < 0.0001);
+        assert!((arc_motion_position(true, false, 0.125, 0.5) - 0.25).abs() < 0.0001);
+        assert!((arc_motion_position(true, false, 0.25, 0.5) - 0.5).abs() < 0.0001);
+        assert!((arc_motion_position(true, false, 0.5, 0.5) - 1.0).abs() < 0.0001);
+        assert!((arc_motion_position(true, true, 0.0, 0.5) - 1.0).abs() < 0.0001);
+        assert!((arc_motion_position(true, true, 0.125, 0.5) - 0.75).abs() < 0.0001);
+        assert!((arc_motion_position(true, true, 0.5, 0.5) - 0.0).abs() < 0.0001);
+    }
 
-        for expected in [0.0_f32, 0.5, 1.0] {
-            let pointer = point_on_arc(center, 80.0, start + sweep * expected);
-            let actual = arc_ratio_from_pointer(pointer, center, start, sweep);
-            assert!((actual - expected).abs() < 0.0001);
-        }
+    #[test]
+    fn arc_motion_uses_a_270_degree_path() {
+        assert!((ARC_SWEEP_ANGLE.to_degrees() - 270.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn arc_marker_pop_is_brief_and_decays_from_the_endpoint() {
+        assert!((arc_endpoint_pop(0.0) - 1.0).abs() < 0.0001);
+        assert!((arc_endpoint_pop(0.07) - 0.25).abs() < 0.0001);
+        assert_eq!(arc_endpoint_pop(0.14), 0.0);
+        assert_eq!(arc_endpoint_pop(1.0), 0.0);
     }
 
     #[test]

@@ -17,6 +17,7 @@ use crate::config::{AppConfig, BuiltinSound};
 pub struct SampleBank {
     pub normal: Vec<f32>,
     pub accent: Vec<f32>,
+    pub subdivision: Vec<f32>,
 }
 
 #[derive(Debug, Error)]
@@ -64,10 +65,23 @@ impl SampleBank {
             .as_deref()
             .and_then(|path| decode_audio_file(path).ok())
             .unwrap_or(builtin_accent);
+        let subdivision = config
+            .sound
+            .subdivision_path
+            .as_deref()
+            .and_then(|path| decode_audio_file(path).ok())
+            .or_else(|| {
+                config
+                    .sound
+                    .subdivision_builtin
+                    .and_then(|sound| decode_wav_mono(builtin_wav(sound)).ok())
+            })
+            .unwrap_or_else(|| normal.clone());
 
         Ok(Self {
             normal: prepare_sample(normal, target_sample_rate),
             accent: prepare_sample(accent, target_sample_rate),
+            subdivision: prepare_sample(subdivision, target_sample_rate),
         })
     }
 }
@@ -158,6 +172,7 @@ fn decode_audio_file(path: &Path) -> Result<DecodedSample, SampleBankError> {
     })
 }
 
+#[derive(Clone)]
 struct DecodedSample {
     sample_rate: u32,
     samples: Vec<f32>,
@@ -290,13 +305,30 @@ fn normalize_peak(samples: &mut [f32], target_peak: f32) {
 mod tests {
     use std::path::Path;
 
-    use super::{builtin_wav, decode_wav_mono, validate_audio_file};
-    use crate::config::BuiltinSound;
+    use super::{SampleBank, builtin_wav, decode_wav_mono, validate_audio_file};
+    use crate::config::{AppConfig, BuiltinSound};
 
     #[test]
     fn embedded_wav_is_accepted_as_a_custom_sound() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/SIN 1.wav");
         validate_audio_file(&path).expect("embedded WAV should decode");
+    }
+
+    #[test]
+    fn subdivision_uses_normal_sound_until_a_custom_source_is_selected() {
+        let mut config = AppConfig::default();
+        let default_bank = SampleBank::from_config(&config, 44_100).expect("samples should load");
+        assert_eq!(default_bank.subdivision, default_bank.normal);
+
+        config.sound.subdivision_builtin = Some(BuiltinSound::Sin1);
+        let builtin_bank = SampleBank::from_config(&config, 44_100).expect("samples should load");
+        assert_ne!(builtin_bank.subdivision, builtin_bank.normal);
+
+        config.sound.subdivision_builtin = None;
+        config.sound.subdivision_path =
+            Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/SIN 1.wav"));
+        let custom_bank = SampleBank::from_config(&config, 44_100).expect("samples should load");
+        assert_ne!(custom_bank.subdivision, custom_bank.normal);
     }
 
     #[test]
