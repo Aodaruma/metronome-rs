@@ -103,7 +103,15 @@ impl BeatScheduler {
                 let target_phase = self
                     .offset_phase(click_offset_ms)
                     .min(subdivision_threshold.saturating_sub(1));
-                if self.pending_current_click && self.phase >= target_phase {
+                // The requested offset can be as long as (or longer than) the
+                // current click interval. In that case `target_phase` is
+                // clamped just before the boundary and may not be exactly
+                // reachable by the phase increment. Fire on the frame that
+                // crosses the target instead of waiting forever.
+                let next_phase = self.phase.saturating_add(self.phase_increment);
+                if self.pending_current_click
+                    && (self.phase >= target_phase || next_phase >= target_phase)
+                {
                     self.pending_current_click = false;
                     event = Some(self.event_for(
                         self.beat_index,
@@ -261,6 +269,29 @@ mod tests {
         let early = collect_intervals(120_000, 4, 8, -30);
         assert!(delayed.iter().all(|&interval| interval == 3_000));
         assert!(early.iter().skip(1).all(|&interval| interval == 3_000));
+    }
+
+    #[test]
+    fn long_positive_offset_does_not_silence_high_bpm() {
+        for bpm_milli in [300_000, 301_000, 1_000_000] {
+            let intervals = collect_intervals(bpm_milli, 4, 1, 200);
+            assert!(
+                !intervals.is_empty(),
+                "BPM {} stopped producing clicks",
+                bpm_milli / 1_000
+            );
+        }
+    }
+
+    #[test]
+    fn long_positive_offset_does_not_silence_subdivisions() {
+        for subdivisions in 2..=8 {
+            let intervals = collect_intervals(120_000, 4, subdivisions, 200);
+            assert!(
+                !intervals.is_empty(),
+                "subdivision {subdivisions} stopped producing clicks"
+            );
+        }
     }
 
     #[test]
