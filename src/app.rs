@@ -1819,6 +1819,15 @@ impl MetronomeApp {
             arc_points(center, radius, start_angle, sweep_angle, 36),
             egui::Stroke::new(7.0, visuals.widgets.inactive.bg_fill),
         ));
+        paint_arc_subdivision_guides(
+            &painter,
+            center,
+            radius,
+            start_angle,
+            sweep_angle,
+            self.config.audio.subdivision,
+            visuals.weak_text_color(),
+        );
         for ratio in [0.0_f32, 0.5, 1.0] {
             let angle = start_angle + sweep_angle * ratio;
             let marker = point_on_arc(center, radius, angle);
@@ -1897,6 +1906,14 @@ impl MetronomeApp {
             center,
             radius,
             egui::Stroke::new(2.0, ui.visuals().weak_text_color()),
+        );
+        paint_circle_subdivision_guides(
+            &painter,
+            center,
+            radius,
+            beats,
+            self.config.audio.subdivision,
+            ui.visuals().weak_text_color(),
         );
         for index in 0..beats {
             let angle = -std::f32::consts::FRAC_PI_2
@@ -2133,6 +2150,55 @@ fn paint_accent_ring(
         plate_radius + 4.0 + expansion,
         egui::Stroke::new(2.0 + pulse * 4.0, color),
     );
+}
+
+fn paint_arc_subdivision_guides(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    start_angle: f32,
+    sweep_angle: f32,
+    subdivisions: u8,
+    color: egui::Color32,
+) {
+    let subdivisions = subdivisions.clamp(1, 8);
+    for index in 1..subdivisions {
+        let ratio = f32::from(index) / f32::from(subdivisions);
+        let angle = start_angle + sweep_angle * ratio;
+        painter.line_segment(
+            [
+                point_on_arc(center, radius - 9.0, angle),
+                point_on_arc(center, radius + 9.0, angle),
+            ],
+            egui::Stroke::new(1.5, color),
+        );
+    }
+}
+
+fn paint_circle_subdivision_guides(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    beats: u8,
+    subdivisions: u8,
+    color: egui::Color32,
+) {
+    let beats = beats.clamp(1, 16);
+    let subdivisions = subdivisions.clamp(1, 8);
+    for beat in 0..beats {
+        for index in 1..subdivisions {
+            let beat_ratio =
+                (f32::from(beat) + f32::from(index) / f32::from(subdivisions)) / f32::from(beats);
+            let angle = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * beat_ratio;
+            painter.line_segment(
+                [
+                    center + egui::vec2(angle.cos(), angle.sin()) * (radius - 6.0),
+                    center + egui::vec2(angle.cos(), angle.sin()) * (radius + 6.0),
+                ],
+                egui::Stroke::new(1.5, color),
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
