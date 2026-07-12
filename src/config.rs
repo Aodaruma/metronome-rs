@@ -126,6 +126,9 @@ impl Default for AudioConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SoundConfig {
+    pub normal_builtin: BuiltinSound,
+    pub accent_builtin: BuiltinSound,
+    pub subdivision_builtin: Option<BuiltinSound>,
     pub normal_path: Option<PathBuf>,
     pub accent_path: Option<PathBuf>,
     pub subdivision_path: Option<PathBuf>,
@@ -135,12 +138,24 @@ pub struct SoundConfig {
 impl Default for SoundConfig {
     fn default() -> Self {
         Self {
+            normal_builtin: BuiltinSound::Sin2,
+            accent_builtin: BuiltinSound::Sin1,
+            subdivision_builtin: None,
             normal_path: None,
             accent_path: None,
             subdivision_path: None,
             accent_enabled: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinSound {
+    Sin1,
+    Sin2,
+    Sin3,
+    Sin4,
 }
 
 impl CloseBehavior {
@@ -361,7 +376,7 @@ pub fn save_config(config: &AppConfig) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, BPM_MAX, BpmPreset, LanguageMode, OUTPUT_BOOST_DB_MAX};
+    use super::{AppConfig, BPM_MAX, BpmPreset, BuiltinSound, LanguageMode, OUTPUT_BOOST_DB_MAX};
 
     #[test]
     fn config_without_language_uses_system_default() {
@@ -387,6 +402,9 @@ mod tests {
         assert!(config.sound.subdivision_path.is_none());
         assert!(config.presets.iter().any(|preset| preset.name == "Andante"));
         assert!(config.presets.iter().any(|preset| preset.name == "Allegro"));
+        assert_eq!(config.sound.normal_builtin, BuiltinSound::Sin2);
+        assert_eq!(config.sound.accent_builtin, BuiltinSound::Sin1);
+        assert!(config.sound.subdivision_builtin.is_none());
     }
 
     #[test]

@@ -11,7 +11,7 @@ use symphonia::core::meta::MetadataOptions;
 
 use thiserror::Error;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, BuiltinSound};
 
 #[derive(Debug, Clone)]
 pub struct SampleBank {
@@ -40,16 +40,18 @@ pub enum SampleBankError {
     FileTooLarge,
 }
 
-const NORMAL_WAV: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/SIN 2.wav"));
-const ACCENT_WAV: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/SIN 1.wav"));
+const SIN_1_WAV: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/SIN 1.wav"));
+const SIN_2_WAV: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/SIN 2.wav"));
+const SIN_3_WAV: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/SIN 3.wav"));
+const SIN_4_WAV: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/SIN 4.wav"));
 
 impl SampleBank {
     pub fn from_config(
         config: &AppConfig,
         target_sample_rate: u32,
     ) -> Result<Self, SampleBankError> {
-        let builtin_normal = decode_wav_mono(NORMAL_WAV)?;
-        let builtin_accent = decode_wav_mono(ACCENT_WAV)?;
+        let builtin_normal = decode_wav_mono(builtin_wav(config.sound.normal_builtin))?;
+        let builtin_accent = decode_wav_mono(builtin_wav(config.sound.accent_builtin))?;
 
         let normal = config
             .sound
@@ -68,6 +70,12 @@ impl SampleBank {
             .subdivision_path
             .as_deref()
             .and_then(|path| decode_audio_file(path).ok())
+            .or_else(|| {
+                config
+                    .sound
+                    .subdivision_builtin
+                    .and_then(|sound| decode_wav_mono(builtin_wav(sound)).ok())
+            })
             .unwrap_or_else(|| normal.clone());
 
         Ok(Self {
@@ -75,6 +83,15 @@ impl SampleBank {
             accent: prepare_sample(accent, target_sample_rate),
             subdivision: prepare_sample(subdivision, target_sample_rate),
         })
+    }
+}
+
+fn builtin_wav(sound: BuiltinSound) -> &'static [u8] {
+    match sound {
+        BuiltinSound::Sin1 => SIN_1_WAV,
+        BuiltinSound::Sin2 => SIN_2_WAV,
+        BuiltinSound::Sin3 => SIN_3_WAV,
+        BuiltinSound::Sin4 => SIN_4_WAV,
     }
 }
 
@@ -288,8 +305,8 @@ fn normalize_peak(samples: &mut [f32], target_peak: f32) {
 mod tests {
     use std::path::Path;
 
-    use super::{SampleBank, validate_audio_file};
-    use crate::config::AppConfig;
+    use super::{SampleBank, builtin_wav, decode_wav_mono, validate_audio_file};
+    use crate::config::{AppConfig, BuiltinSound};
 
     #[test]
     fn embedded_wav_is_accepted_as_a_custom_sound() {
@@ -303,9 +320,27 @@ mod tests {
         let default_bank = SampleBank::from_config(&config, 44_100).expect("samples should load");
         assert_eq!(default_bank.subdivision, default_bank.normal);
 
+        config.sound.subdivision_builtin = Some(BuiltinSound::Sin1);
+        let builtin_bank = SampleBank::from_config(&config, 44_100).expect("samples should load");
+        assert_ne!(builtin_bank.subdivision, builtin_bank.normal);
+
+        config.sound.subdivision_builtin = None;
         config.sound.subdivision_path =
             Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/SIN 1.wav"));
         let custom_bank = SampleBank::from_config(&config, 44_100).expect("samples should load");
         assert_ne!(custom_bank.subdivision, custom_bank.normal);
+    }
+
+    #[test]
+    fn every_builtin_sound_decodes() {
+        for sound in [
+            BuiltinSound::Sin1,
+            BuiltinSound::Sin2,
+            BuiltinSound::Sin3,
+            BuiltinSound::Sin4,
+        ] {
+            let decoded = decode_wav_mono(builtin_wav(sound)).expect("built-in WAV should decode");
+            assert!(!decoded.samples.is_empty());
+        }
     }
 }

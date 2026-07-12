@@ -5,9 +5,9 @@ use eframe::egui;
 
 use crate::audio::{AudioDiagnostics, AudioEngine, BeatEvent, validate_audio_file};
 use crate::config::{
-    AppConfig, BPM_MAX, BPM_MIN, BpmPreset, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS,
-    CloseBehavior, Language, LanguageMode, MeterMode, OUTPUT_BOOST_DB_MAX, ThemeMode, load_config,
-    save_config,
+    AppConfig, BPM_MAX, BPM_MIN, BpmPreset, BuiltinSound, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS,
+    CloseBehavior, Language, LanguageMode, MeterMode, OUTPUT_BOOST_DB_MAX, SoundConfig, ThemeMode,
+    load_config, save_config,
 };
 use crate::fonts::install_japanese_font;
 use crate::menu::{MenuCommand, NativeMenu};
@@ -28,7 +28,7 @@ enum AppTab {
     Preferences,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SoundKind {
     Normal,
     Accent,
@@ -523,10 +523,32 @@ impl MetronomeApp {
         self.rebuild_audio_engine();
     }
 
+    fn set_builtin_sound(&mut self, kind: SoundKind, sound: Option<BuiltinSound>) {
+        match kind {
+            SoundKind::Normal => {
+                let Some(sound) = sound else { return };
+                self.config.sound.normal_builtin = sound;
+                self.config.sound.normal_path = None;
+            }
+            SoundKind::Accent => {
+                let Some(sound) = sound else { return };
+                self.config.sound.accent_builtin = sound;
+                self.config.sound.accent_path = None;
+            }
+            SoundKind::Subdivision => {
+                self.config.sound.subdivision_builtin = sound;
+                self.config.sound.subdivision_path = None;
+            }
+        }
+        self.persist_config();
+        self.rebuild_audio_engine();
+    }
+
     fn reset_all_sound_files(&mut self) {
-        self.config.sound.normal_path = None;
-        self.config.sound.accent_path = None;
-        self.config.sound.subdivision_path = None;
+        self.config.sound = SoundConfig {
+            accent_enabled: self.config.sound.accent_enabled,
+            ..SoundConfig::default()
+        };
         self.persist_config();
         self.rebuild_audio_engine();
     }
@@ -1311,28 +1333,54 @@ impl MetronomeApp {
             SoundKind::Accent => tr(lang, "アクセント", "Accent"),
             SoundKind::Subdivision => "Subdivision",
         };
+        let selected_builtin = match kind {
+            SoundKind::Normal => Some(self.config.sound.normal_builtin),
+            SoundKind::Accent => Some(self.config.sound.accent_builtin),
+            SoundKind::Subdivision => self.config.sound.subdivision_builtin,
+        };
         let display_name = selected_path
             .as_deref()
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
-            .unwrap_or_else(|| match kind {
-                SoundKind::Subdivision => tr(lang, "通常音を使用", "Use normal sound"),
-                SoundKind::Normal | SoundKind::Accent => tr(lang, "内蔵音", "Built-in"),
+            .unwrap_or_else(|| {
+                selected_builtin.map_or_else(
+                    || tr(lang, "通常音を使用", "Use normal sound"),
+                    builtin_sound_label,
+                )
             });
+        let mut builtin = selected_builtin;
+        let mut builtin_changed = false;
         let mut choose_clicked = false;
         let mut reset_clicked = false;
-        let spacing = ui.spacing().item_spacing.x;
-        let file_width =
-            (ui.available_width() - 96.0 - 58.0 - 84.0 - spacing * 3.0).clamp(80.0, 170.0);
 
         ui.horizontal(|ui| {
             ui.add_sized([96.0, 24.0], egui::Label::new(label));
-            let file_label = ui.add_sized(
-                [file_width, 24.0],
-                egui::Label::new(display_name).truncate(),
-            );
+            let combo = egui::ComboBox::from_id_salt(("builtin_sound", kind))
+                .selected_text(display_name)
+                .width(120.0)
+                .show_ui(ui, |ui| {
+                    if kind == SoundKind::Subdivision {
+                        builtin_changed |= ui
+                            .selectable_value(
+                                &mut builtin,
+                                None,
+                                tr(lang, "通常音を使用", "Use normal sound"),
+                            )
+                            .changed();
+                    }
+                    for value in [
+                        BuiltinSound::Sin1,
+                        BuiltinSound::Sin2,
+                        BuiltinSound::Sin3,
+                        BuiltinSound::Sin4,
+                    ] {
+                        builtin_changed |= ui
+                            .selectable_value(&mut builtin, Some(value), builtin_sound_label(value))
+                            .changed();
+                    }
+                });
             if let Some(path) = &selected_path {
-                file_label.on_hover_text(path.display().to_string());
+                combo.response.on_hover_text(path.display().to_string());
             }
             choose_clicked = ui
                 .button(tr(lang, "選択…", "Choose…"))
@@ -1346,7 +1394,10 @@ impl MetronomeApp {
                 .add_enabled(
                     selected_path.is_some(),
                     egui::Button::new(match kind {
-                        SoundKind::Subdivision => tr(lang, "通常音に戻す", "Use normal"),
+                        SoundKind::Subdivision if selected_builtin.is_none() => {
+                            tr(lang, "通常音に戻す", "Use normal")
+                        }
+                        SoundKind::Subdivision => tr(lang, "内蔵に戻す", "Use built-in"),
                         SoundKind::Normal | SoundKind::Accent => {
                             tr(lang, "内蔵に戻す", "Use built-in")
                         }
@@ -1355,7 +1406,9 @@ impl MetronomeApp {
                 .clicked();
         });
 
-        if choose_clicked {
+        if builtin_changed {
+            self.set_builtin_sound(kind, builtin);
+        } else if choose_clicked {
             self.choose_sound_file(kind);
         } else if reset_clicked {
             self.reset_sound_file(kind);
@@ -2421,6 +2474,15 @@ fn theme_label(lang: Language, theme: ThemeMode) -> &'static str {
         ThemeMode::System => tr(lang, "システム設定", "System"),
         ThemeMode::Dark => tr(lang, "ダーク", "Dark"),
         ThemeMode::Light => tr(lang, "ライト", "Light"),
+    }
+}
+
+fn builtin_sound_label(sound: BuiltinSound) -> &'static str {
+    match sound {
+        BuiltinSound::Sin1 => "SIN 1",
+        BuiltinSound::Sin2 => "SIN 2",
+        BuiltinSound::Sin3 => "SIN 3",
+        BuiltinSound::Sin4 => "SIN 4",
     }
 }
 

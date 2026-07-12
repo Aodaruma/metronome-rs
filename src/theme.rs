@@ -14,9 +14,25 @@ pub const LIGHT_HOVERED_WEAK_BG: [u8; 3] = [190, 196, 201];
 pub const DARK_TEXT_ON_ACCENT: [u8; 3] = [25, 27, 29];
 
 pub fn apply(ctx: &egui::Context, theme: ThemeMode, accent_rgb: [u8; 3]) {
+    ctx.set_visuals_of(
+        egui::Theme::Dark,
+        visuals_for(egui::Theme::Dark, accent_rgb),
+    );
+    ctx.set_visuals_of(
+        egui::Theme::Light,
+        visuals_for(egui::Theme::Light, accent_rgb),
+    );
+    ctx.set_theme(match theme {
+        ThemeMode::System => egui::ThemePreference::System,
+        ThemeMode::Dark => egui::ThemePreference::Dark,
+        ThemeMode::Light => egui::ThemePreference::Light,
+    });
+}
+
+fn visuals_for(theme: egui::Theme, accent_rgb: [u8; 3]) -> egui::Visuals {
     let mut visuals = match theme {
-        ThemeMode::System | ThemeMode::Dark => egui::Visuals::dark(),
-        ThemeMode::Light => {
+        egui::Theme::Dark => egui::Visuals::dark(),
+        egui::Theme::Light => {
             let mut visuals = egui::Visuals::light();
             visuals.panel_fill = rgb(LIGHT_PANEL_FILL);
             visuals.window_fill = rgb(LIGHT_WINDOW_FILL);
@@ -31,7 +47,7 @@ pub fn apply(ctx: &egui::Context, theme: ThemeMode, accent_rgb: [u8; 3]) {
     let accent = rgb(accent_rgb);
     visuals.selection.bg_fill = accent;
     visuals.selection.stroke.color = readable_on(accent);
-    ctx.set_visuals(visuals);
+    visuals
 }
 
 pub fn central_plate_color(
@@ -72,11 +88,24 @@ fn readable_on(color: egui::Color32) -> egui::Color32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{LIGHT_EXTREME_BG, rgb};
+    use super::{LIGHT_EXTREME_BG, apply, rgb};
+    use crate::config::ThemeMode;
+    use eframe::egui;
 
     #[test]
     fn palette_values_compile_to_expected_color() {
         let color = rgb(LIGHT_EXTREME_BG);
         assert_eq!([color.r(), color.g(), color.b()], [205, 210, 214]);
+    }
+
+    #[test]
+    fn apply_updates_the_egui_theme_preference() {
+        let ctx = egui::Context::default();
+
+        apply(&ctx, ThemeMode::Dark, [0, 122, 170]);
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+
+        apply(&ctx, ThemeMode::Light, [0, 122, 170]);
+        assert_eq!(ctx.theme(), egui::Theme::Light);
     }
 }
