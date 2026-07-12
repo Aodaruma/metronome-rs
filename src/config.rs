@@ -10,7 +10,8 @@ pub const BPM_MIN: u32 = 20_000;
 pub const BPM_MAX: u32 = 1_000_000;
 pub const CLICK_OFFSET_MIN_MS: i32 = -200;
 pub const CLICK_OFFSET_MAX_MS: i32 = 200;
-pub const OUTPUT_BOOST_DB_MAX: f32 = 12.0;
+pub const OUTPUT_VOLUME_DB_MIN: f32 = -60.0;
+pub const OUTPUT_VOLUME_DB_MAX: f32 = 12.0;
 pub const BPM_DRAG_SENSITIVITY_DEFAULT: f32 = 1.0 / 3.0;
 pub const TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT: f32 = 0.1;
 pub const DRAG_SENSITIVITY_MIN: f32 = 0.05;
@@ -122,7 +123,8 @@ pub struct AppearanceConfig {
 #[serde(default)]
 pub struct AudioConfig {
     pub click_timing_offset_ms: i32,
-    pub output_boost_db: f32,
+    #[serde(alias = "output_boost_db")]
+    pub output_volume_db: f32,
     pub subdivision: u8,
 }
 
@@ -130,7 +132,7 @@ impl Default for AudioConfig {
     fn default() -> Self {
         Self {
             click_timing_offset_ms: 0,
-            output_boost_db: 0.0,
+            output_volume_db: 0.0,
             subdivision: 1,
         }
     }
@@ -290,10 +292,13 @@ impl AppConfig {
             .audio
             .click_timing_offset_ms
             .clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS);
-        if !self.audio.output_boost_db.is_finite() {
-            self.audio.output_boost_db = 0.0;
+        if !self.audio.output_volume_db.is_finite() {
+            self.audio.output_volume_db = 0.0;
         }
-        self.audio.output_boost_db = self.audio.output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX);
+        self.audio.output_volume_db = self
+            .audio
+            .output_volume_db
+            .clamp(OUTPUT_VOLUME_DB_MIN, OUTPUT_VOLUME_DB_MAX);
         self.audio.subdivision = self.audio.subdivision.clamp(1, 8);
         if source_schema_version < 3 {
             self.sound.normal_volume_percent = self.volume_percent;
@@ -432,8 +437,8 @@ pub fn save_config(config: &AppConfig) -> io::Result<()> {
 mod tests {
     use super::{
         AppConfig, BPM_DRAG_SENSITIVITY_DEFAULT, BPM_MAX, BpmPreset, BuiltinSound,
-        CONFIG_SCHEMA_VERSION, DRAG_SENSITIVITY_MAX, LanguageMode, OUTPUT_BOOST_DB_MAX,
-        TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT,
+        CONFIG_SCHEMA_VERSION, DRAG_SENSITIVITY_MAX, LanguageMode, OUTPUT_VOLUME_DB_MAX,
+        OUTPUT_VOLUME_DB_MIN, TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT,
     };
 
     #[test]
@@ -454,7 +459,7 @@ mod tests {
         assert_eq!(config.shortcuts.toggle_playback, "Space");
         assert_eq!(config.shortcuts.bpm_up, "ArrowUp");
         assert_eq!(config.shortcuts.bpm_down, "ArrowDown");
-        assert_eq!(config.audio.output_boost_db, 0.0);
+        assert_eq!(config.audio.output_volume_db, 0.0);
         assert_eq!(config.audio.subdivision, 1);
         assert!(config.sound.accent_enabled);
         assert_eq!(config.sound.normal_volume_percent, 70);
@@ -509,23 +514,27 @@ mod tests {
     #[test]
     fn audio_enhancements_are_sanitized() {
         let mut config = AppConfig::default();
-        config.audio.output_boost_db = 99.0;
+        config.audio.output_volume_db = 99.0;
         config.audio.subdivision = 0;
         config.sound.normal_volume_percent = 200;
         config.sound.accent_volume_percent = 150;
         config.sound.subdivision_volume_percent = 101;
         config.sanitize();
-        assert_eq!(config.audio.output_boost_db, OUTPUT_BOOST_DB_MAX);
+        assert_eq!(config.audio.output_volume_db, OUTPUT_VOLUME_DB_MAX);
         assert_eq!(config.audio.subdivision, 1);
         assert_eq!(config.sound.normal_volume_percent, 100);
         assert_eq!(config.sound.accent_volume_percent, 100);
         assert_eq!(config.sound.subdivision_volume_percent, 100);
 
-        config.audio.output_boost_db = f32::NAN;
+        config.audio.output_volume_db = f32::NAN;
         config.audio.subdivision = 99;
         config.sanitize();
-        assert_eq!(config.audio.output_boost_db, 0.0);
+        assert_eq!(config.audio.output_volume_db, 0.0);
         assert_eq!(config.audio.subdivision, 8);
+
+        config.audio.output_volume_db = -99.0;
+        config.sanitize();
+        assert_eq!(config.audio.output_volume_db, OUTPUT_VOLUME_DB_MIN);
     }
 
     #[test]
@@ -541,6 +550,21 @@ mod tests {
         assert_eq!(config.sound.normal_volume_percent, 55);
         assert_eq!(config.sound.accent_volume_percent, 55);
         assert_eq!(config.sound.subdivision_volume_percent, 33);
+    }
+
+    #[test]
+    fn legacy_output_boost_loads_as_output_volume() {
+        let json = r#"{
+            "schema_version": 3,
+            "audio": { "output_boost_db": 6.0 }
+        }"#;
+
+        let mut config = serde_json::from_str::<AppConfig>(json).expect("config should migrate");
+        config.sanitize();
+        assert_eq!(config.audio.output_volume_db, 6.0);
+        let saved = serde_json::to_string(&config).expect("config should serialize");
+        assert!(saved.contains("output_volume_db"));
+        assert!(!saved.contains("output_boost_db"));
     }
 
     #[test]

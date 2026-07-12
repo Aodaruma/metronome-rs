@@ -7,7 +7,7 @@ use crate::audio::{AudioDiagnostics, AudioEngine, BeatEvent, validate_audio_file
 use crate::config::{
     AppConfig, BPM_MAX, BPM_MIN, BpmPreset, BuiltinSound, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS,
     CloseBehavior, DRAG_SENSITIVITY_MAX, DRAG_SENSITIVITY_MIN, Language, LanguageMode, MeterMode,
-    OUTPUT_BOOST_DB_MAX, SoundConfig, ThemeMode, load_config, save_config,
+    OUTPUT_VOLUME_DB_MAX, OUTPUT_VOLUME_DB_MIN, SoundConfig, ThemeMode, load_config, save_config,
 };
 use crate::fonts::install_japanese_font;
 use crate::menu::{MenuCommand, NativeMenu};
@@ -324,7 +324,7 @@ impl MetronomeApp {
                 self.config.sound.normal_volume_percent,
                 self.config.sound.accent_volume_percent,
                 self.config.sound.subdivision_volume_percent,
-                self.config.audio.output_boost_db,
+                self.config.audio.output_volume_db,
             );
         }
     }
@@ -365,12 +365,12 @@ impl MetronomeApp {
         self.persist_config();
     }
 
-    fn set_output_boost_db(&mut self, output_boost_db: f32) {
-        let next = output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX);
-        if (self.config.audio.output_boost_db - next).abs() < f32::EPSILON {
+    fn set_output_volume_db(&mut self, output_volume_db: f32) {
+        let next = output_volume_db.clamp(OUTPUT_VOLUME_DB_MIN, OUTPUT_VOLUME_DB_MAX);
+        if (self.config.audio.output_volume_db - next).abs() < f32::EPSILON {
             return;
         }
-        self.config.audio.output_boost_db = next;
+        self.config.audio.output_volume_db = next;
         self.sync_output_levels();
         self.persist_config();
     }
@@ -1033,12 +1033,12 @@ impl MetronomeApp {
         let mut normal_volume = i32::from(self.config.sound.normal_volume_percent);
         let mut accent_volume = i32::from(self.config.sound.accent_volume_percent);
         let mut subdivision_volume = i32::from(self.config.sound.subdivision_volume_percent);
-        let mut output_boost_db = self.config.audio.output_boost_db;
+        let mut output_volume_db = self.config.audio.output_volume_db;
         let mut offset_ms = self.config.audio.click_timing_offset_ms;
         let mut subdivision = self.config.audio.subdivision;
         let mut accent_enabled = self.config.sound.accent_enabled;
         let mut sound_volume_changed = false;
-        let mut boost_changed = false;
+        let mut output_volume_changed = false;
         egui::Frame::group(ui.style())
             .corner_radius(8.0)
             .inner_margin(12.0)
@@ -1046,17 +1046,26 @@ impl MetronomeApp {
                 ui.set_width(ui.available_width());
                 ui.label(egui::RichText::new(tr(lang, "サウンド", "Sound")).strong());
                 ui.add_space(6.0);
-                boost_changed = ui
+                output_volume_changed = ui
                     .add(
-                        egui::Slider::new(&mut output_boost_db, 0.0..=OUTPUT_BOOST_DB_MAX)
-                            .step_by(0.5)
-                            .suffix(" dB")
-                            .text(tr(lang, "全体音量ブースト", "Overall volume boost")),
+                        egui::Slider::new(
+                            &mut output_volume_db,
+                            OUTPUT_VOLUME_DB_MIN..=OUTPUT_VOLUME_DB_MAX,
+                        )
+                        .step_by(0.5)
+                        .custom_formatter(|value, _| {
+                            if value <= f64::from(OUTPUT_VOLUME_DB_MIN) {
+                                "−∞ dB".to_owned()
+                            } else {
+                                format!("{value:+.1} dB")
+                            }
+                        })
+                        .text(tr(lang, "全体音量", "Overall volume")),
                     )
                     .on_hover_text(tr(
                         lang,
-                        "元の音量を最大 +12 dB まで増幅します。音割れする場合は下げてください。",
-                        "Boosts the source by up to +12 dB. Reduce it if clipping occurs.",
+                        "−∞ dBでミュート、最大+12 dBまで調整できます。",
+                        "Adjusts from mute at −∞ dB up to +12 dB.",
                     ))
                     .changed();
                 ui.add_space(8.0);
@@ -1127,8 +1136,8 @@ impl MetronomeApp {
                 subdivision_volume as u8,
             );
         }
-        if boost_changed {
-            self.set_output_boost_db(output_boost_db);
+        if output_volume_changed {
+            self.set_output_volume_db(output_volume_db);
         }
         if offset_ms != self.config.audio.click_timing_offset_ms {
             self.set_click_offset_ms(offset_ms);

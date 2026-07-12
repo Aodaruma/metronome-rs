@@ -9,7 +9,8 @@ use thiserror::Error;
 use crate::audio::sample_bank::{SampleBank, SampleBankError};
 use crate::audio::scheduler::{BeatEvent, BeatScheduler};
 use crate::config::{
-    AppConfig, BPM_MAX, BPM_MIN, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS, OUTPUT_BOOST_DB_MAX,
+    AppConfig, BPM_MAX, BPM_MIN, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS, OUTPUT_VOLUME_DB_MAX,
+    OUTPUT_VOLUME_DB_MIN,
 };
 
 const MAX_VOICES: usize = 16;
@@ -162,7 +163,7 @@ impl AudioEngine {
         normal_volume_percent: u8,
         accent_volume_percent: u8,
         subdivision_volume_percent: u8,
-        output_boost_db: f32,
+        output_volume_db: f32,
     ) {
         self.shared.normal_gain_bits.store(
             percent_gain(normal_volume_percent).to_bits(),
@@ -177,7 +178,7 @@ impl AudioEngine {
             Ordering::Relaxed,
         );
         self.shared.boost_gain_bits.store(
-            db_to_gain(output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX)).to_bits(),
+            output_volume_gain(output_volume_db).to_bits(),
             Ordering::Relaxed,
         );
     }
@@ -271,7 +272,7 @@ impl AudioShared {
             running: AtomicBool::new(false),
             bpm_milli: AtomicU32::new(config.bpm_milli.clamp(BPM_MIN, BPM_MAX)),
             boost_gain_bits: AtomicU32::new(
-                db_to_gain(config.audio.output_boost_db.clamp(0.0, OUTPUT_BOOST_DB_MAX)).to_bits(),
+                output_volume_gain(config.audio.output_volume_db).to_bits(),
             ),
             normal_gain_bits: AtomicU32::new(
                 percent_gain(config.sound.normal_volume_percent).to_bits(),
@@ -442,7 +443,7 @@ impl RenderState {
 
     fn advance_gain(&mut self) {
         let target = f32::from_bits(self.shared.boost_gain_bits.load(Ordering::Relaxed))
-            .clamp(0.0, db_to_gain(OUTPUT_BOOST_DB_MAX));
+            .clamp(0.0, db_to_gain(OUTPUT_VOLUME_DB_MAX));
         if (self.current_gain - target).abs() <= self.gain_step {
             self.current_gain = target;
         } else if self.current_gain < target {
@@ -483,6 +484,15 @@ fn percent_gain(volume_percent: u8) -> f32 {
     f32::from(volume_percent.min(100)) / 100.0
 }
 
+fn output_volume_gain(db: f32) -> f32 {
+    let db = db.clamp(OUTPUT_VOLUME_DB_MIN, OUTPUT_VOLUME_DB_MAX);
+    if db <= OUTPUT_VOLUME_DB_MIN {
+        0.0
+    } else {
+        db_to_gain(db)
+    }
+}
+
 fn db_to_gain(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
 }
@@ -511,14 +521,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{VoiceSample, db_to_gain, percent_gain, voice_sample_for_beat};
+    use super::{VoiceSample, db_to_gain, output_volume_gain, percent_gain, voice_sample_for_beat};
     use crate::audio::BeatEvent;
 
     #[test]
-    fn sound_percent_and_boost_are_independent_gain_stages() {
+    fn sound_percent_and_output_volume_are_independent_gain_stages() {
         let gain = db_to_gain(12.0);
         assert!((gain - 3.981_071_7).abs() < 0.0001);
         assert!((percent_gain(50) * gain - gain * 0.5).abs() < 0.0001);
+        assert_eq!(output_volume_gain(-60.0), 0.0);
+        assert!((output_volume_gain(-6.0) - 0.501_187_2).abs() < 0.0001);
     }
 
     #[test]
