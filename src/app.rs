@@ -1652,10 +1652,19 @@ impl MetronomeApp {
 
         let motion_angle = start_angle + sweep_angle * motion_ratio.clamp(0.0, 1.0);
         let motion_marker = point_on_arc(center, radius, motion_angle);
-        painter.line_segment(
-            [center, motion_marker],
-            egui::Stroke::new(3.0 + pulse, active_color),
-        );
+        if self.is_running() {
+            let motion_direction = if self.arc_at_end { -1.0 } else { 1.0 };
+            paint_arc_motion_trail(
+                &painter,
+                center,
+                radius,
+                start_angle,
+                sweep_angle,
+                motion_ratio,
+                motion_direction,
+                active_color,
+            );
+        }
 
         let plate_radius = base_radius * 0.61;
         let plate_fill = theme::central_plate_color(
@@ -1940,6 +1949,46 @@ fn paint_accent_ring(
         plate_radius + 4.0 + expansion,
         egui::Stroke::new(2.0 + pulse * 4.0, color),
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_arc_motion_trail(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    radius: f32,
+    start_angle: f32,
+    sweep_angle: f32,
+    motion_ratio: f32,
+    motion_direction: f32,
+    color: egui::Color32,
+) {
+    const TRAIL_LENGTH: f32 = 0.16;
+    const TRAIL_SEGMENTS: usize = 12;
+
+    for index in (0..TRAIL_SEGMENTS).rev() {
+        let near_distance = index as f32 / TRAIL_SEGMENTS as f32 * TRAIL_LENGTH;
+        let far_distance = (index + 1) as f32 / TRAIL_SEGMENTS as f32 * TRAIL_LENGTH;
+        let near_ratio = (motion_ratio - motion_direction * near_distance).clamp(0.0, 1.0);
+        let far_ratio = (motion_ratio - motion_direction * far_distance).clamp(0.0, 1.0);
+        if (near_ratio - far_ratio).abs() <= f32::EPSILON {
+            continue;
+        }
+
+        let strength = 1.0 - index as f32 / TRAIL_SEGMENTS as f32;
+        let alpha = (f32::from(color.a()) * 0.72 * strength.powf(1.4)).round() as u8;
+        let trail_color =
+            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+        painter.add(egui::Shape::line(
+            arc_points(
+                center,
+                radius,
+                start_angle + sweep_angle * far_ratio,
+                sweep_angle * (near_ratio - far_ratio),
+                3,
+            ),
+            egui::Stroke::new(2.0 + 6.0 * strength, trail_color),
+        ));
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2235,8 +2284,7 @@ fn arc_motion_position(
         return 0.5;
     }
     let progress = (elapsed_seconds / beat_interval_seconds).clamp(0.0, 1.0) as f32;
-    let eased = 0.5 - 0.5 * (std::f32::consts::PI * progress).cos();
-    if at_end { 1.0 - eased } else { eased }
+    if at_end { 1.0 - progress } else { progress }
 }
 
 impl eframe::App for MetronomeApp {
@@ -2386,12 +2434,14 @@ mod tests {
     use crate::config::BpmPreset;
 
     #[test]
-    fn arc_motion_moves_between_endpoints_and_centers_when_stopped() {
+    fn arc_motion_moves_linearly_and_centers_when_stopped() {
         assert_eq!(arc_motion_position(false, false, 0.0, 0.5), 0.5);
         assert!((arc_motion_position(true, false, 0.0, 0.5) - 0.0).abs() < 0.0001);
+        assert!((arc_motion_position(true, false, 0.125, 0.5) - 0.25).abs() < 0.0001);
         assert!((arc_motion_position(true, false, 0.25, 0.5) - 0.5).abs() < 0.0001);
         assert!((arc_motion_position(true, false, 0.5, 0.5) - 1.0).abs() < 0.0001);
         assert!((arc_motion_position(true, true, 0.0, 0.5) - 1.0).abs() < 0.0001);
+        assert!((arc_motion_position(true, true, 0.125, 0.5) - 0.75).abs() < 0.0001);
         assert!((arc_motion_position(true, true, 0.5, 0.5) - 0.0).abs() < 0.0001);
     }
 
