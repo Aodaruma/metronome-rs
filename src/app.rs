@@ -445,13 +445,12 @@ impl MetronomeApp {
         self.persist_config();
     }
 
-    fn set_accent_color(&mut self, ctx: &egui::Context, color: egui::Color32) {
-        let next = [color.r(), color.g(), color.b()];
-        if self.config.appearance.accent_rgb == next {
+    fn set_accent_color(&mut self, ctx: &egui::Context, accent_rgb: [u8; 3]) {
+        if self.config.appearance.accent_rgb == accent_rgb {
             return;
         }
-        self.config.appearance.accent_rgb = next;
-        theme::apply(ctx, self.config.theme, next);
+        self.config.appearance.accent_rgb = accent_rgb;
+        theme::apply(ctx, self.config.theme, accent_rgb);
         self.persist_config();
     }
 
@@ -939,11 +938,7 @@ impl MetronomeApp {
         let mut language = self.config.language;
         let mut theme = self.config.theme;
         let mut meter_mode = self.config.meter_mode;
-        let mut accent_color = egui::Color32::from_rgb(
-            self.config.appearance.accent_rgb[0],
-            self.config.appearance.accent_rgb[1],
-            self.config.appearance.accent_rgb[2],
-        );
+        let mut accent_rgb = self.config.appearance.accent_rgb;
         let mut accent_center_flash = self.config.appearance.accent_center_flash;
         egui::Frame::group(ui.style())
             .corner_radius(8.0)
@@ -1009,10 +1004,7 @@ impl MetronomeApp {
                 ui.add_space(6.0);
                 ui.separator();
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(tr(lang, "アクセントカラー", "Accent color"));
-                    ui.color_edit_button_srgba(&mut accent_color);
-                });
+                show_accent_color_editor(ui, lang, &mut accent_rgb);
                 ui.checkbox(
                     &mut accent_center_flash,
                     tr(
@@ -1030,7 +1022,7 @@ impl MetronomeApp {
         self.set_language(language);
         self.set_theme(ctx, theme);
         self.set_meter_mode(meter_mode);
-        self.set_accent_color(ctx, accent_color);
+        self.set_accent_color(ctx, accent_rgb);
         if self.config.appearance.accent_center_flash != accent_center_flash {
             self.config.appearance.accent_center_flash = accent_center_flash;
             self.persist_config();
@@ -2415,6 +2407,31 @@ fn normalize_beat_unit(value: u8) -> u8 {
 
 fn adjusted_percent(value: u8, delta: i16) -> u8 {
     (i16::from(value) + delta).clamp(0, 100) as u8
+}
+
+fn show_accent_color_editor(ui: &mut egui::Ui, lang: Language, rgb: &mut [u8; 3]) {
+    ui.horizontal(|ui| {
+        ui.label(tr(lang, "アクセントカラー", "Accent color"));
+        let color = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(84.0, 24.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 4.0, color);
+        ui.painter().rect_stroke(
+            rect,
+            4.0,
+            egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
+            egui::StrokeKind::Inside,
+        );
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]),
+            egui::FontId::monospace(12.0),
+            theme::readable_text_color(color),
+        );
+    });
+    ui.add(egui::Slider::new(&mut rgb[0], 0..=255).text("R"));
+    ui.add(egui::Slider::new(&mut rgb[1], 0..=255).text("G"));
+    ui.add(egui::Slider::new(&mut rgb[2], 0..=255).text("B"));
 }
 
 fn unique_preset_name(presets: &[BpmPreset], requested: &str) -> String {

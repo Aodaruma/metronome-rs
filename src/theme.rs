@@ -46,7 +46,7 @@ fn visuals_for(theme: egui::Theme, accent_rgb: [u8; 3]) -> egui::Visuals {
     };
     let accent = rgb(accent_rgb);
     visuals.selection.bg_fill = accent;
-    visuals.selection.stroke.color = readable_on(accent);
+    visuals.selection.stroke.color = readable_text_color(accent);
     visuals
 }
 
@@ -75,7 +75,7 @@ fn mix_color(from: egui::Color32, to: egui::Color32, amount: f32) -> egui::Color
     )
 }
 
-fn readable_on(color: egui::Color32) -> egui::Color32 {
+pub fn readable_text_color(color: egui::Color32) -> egui::Color32 {
     let luminance = 0.2126 * f32::from(color.r())
         + 0.7152 * f32::from(color.g())
         + 0.0722 * f32::from(color.b());
