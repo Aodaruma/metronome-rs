@@ -2709,7 +2709,9 @@ fn captured_shortcut(ctx: &egui::Context) -> Option<String> {
                 modifiers,
                 ..
             } => {
-                if *key == egui::Key::Escape {
+                if is_modifier_key(*key) {
+                    None
+                } else if *key == egui::Key::Escape {
                     Some(String::new())
                 } else {
                     Some(format_shortcut(*modifiers, *key))
@@ -2718,6 +2720,20 @@ fn captured_shortcut(ctx: &egui::Context) -> Option<String> {
             _ => None,
         })
     })
+}
+
+fn is_modifier_key(key: egui::Key) -> bool {
+    matches!(
+        key,
+        egui::Key::ShiftLeft
+            | egui::Key::ShiftRight
+            | egui::Key::ControlLeft
+            | egui::Key::ControlRight
+            | egui::Key::AltLeft
+            | egui::Key::AltRight
+            | egui::Key::SuperLeft
+            | egui::Key::SuperRight
+    )
 }
 
 fn format_shortcut(modifiers: egui::Modifiers, key: egui::Key) -> String {
@@ -3147,7 +3163,7 @@ mod tests {
     use eframe::egui;
 
     use super::{
-        ARC_SWEEP_ANGLE, arc_endpoint_pop, arc_motion_position, format_shortcut,
+        ARC_SWEEP_ANGLE, arc_endpoint_pop, arc_motion_position, format_shortcut, is_modifier_key,
         normalize_beat_unit, subdivision_guide_emphasis, unique_preset_name,
     };
     use crate::config::BpmPreset;
@@ -3223,5 +3239,8 @@ mod tests {
             format_shortcut(egui::Modifiers::SHIFT, egui::Key::ArrowUp),
             "Shift+ArrowUp"
         );
+        assert!(is_modifier_key(egui::Key::ShiftLeft));
+        assert!(is_modifier_key(egui::Key::ControlRight));
+        assert!(!is_modifier_key(egui::Key::ArrowUp));
     }
 }
