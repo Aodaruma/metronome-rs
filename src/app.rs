@@ -2012,7 +2012,7 @@ fn paint_arc_motion_trail(
     motion_direction: f32,
     color: egui::Color32,
 ) {
-    const TRAIL_LENGTH: f32 = 0.16;
+    const TRAIL_LENGTH: f32 = 0.6;
     const TRAIL_SEGMENTS: usize = 12;
 
     for index in (0..TRAIL_SEGMENTS).rev() {
