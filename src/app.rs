@@ -858,7 +858,8 @@ impl MetronomeApp {
         match self.config.meter_mode {
             MeterMode::Arc => {
                 let motion_ratio = self.arc_motion_ratio(ctx);
-                self.show_arc_meter(ui, meter_size, pulse, accent_pulse, motion_ratio);
+                let endpoint_pop = self.arc_endpoint_pop_amount(ctx);
+                self.show_arc_meter(ui, meter_size, accent_pulse, motion_ratio, endpoint_pop);
             }
             MeterMode::Circle => self.show_circle_meter(ui, meter_size, pulse, accent_pulse),
         }
@@ -1413,6 +1414,14 @@ impl MetronomeApp {
         )
     }
 
+    fn arc_endpoint_pop_amount(&self, ctx: &egui::Context) -> f32 {
+        if !self.is_running() || self.last_primary_beat_time < 0.0 {
+            return 0.0;
+        }
+        let now = ctx.input(|input| input.time);
+        arc_endpoint_pop((now - self.last_primary_beat_time).max(0.0))
+    }
+
     fn show_meter_toolbar(&mut self, ui: &mut egui::Ui, meter_rect: egui::Rect) {
         let lang = self.language();
         let button_size = egui::vec2(40.0, 40.0);
@@ -1612,9 +1621,9 @@ impl MetronomeApp {
         &mut self,
         ui: &mut egui::Ui,
         size: f32,
-        pulse: f32,
         accent_pulse: f32,
         motion_ratio: f32,
+        endpoint_pop: f32,
     ) {
         let (rect, response) = centered_row(ui, size, size, |ui| {
             ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover())
@@ -1683,10 +1692,11 @@ impl MetronomeApp {
             egui::Stroke::new(1.0, visuals.widgets.inactive.bg_stroke.color),
         );
         paint_accent_ring(&painter, center, plate_radius, accent_pulse, active_color);
-        painter.circle_filled(motion_marker, 10.0 + pulse * 2.0, active_color);
+        let marker_pop = endpoint_pop * 6.0;
+        painter.circle_filled(motion_marker, 10.0 + marker_pop, active_color);
         painter.circle_stroke(
             motion_marker,
-            12.0 + pulse * 2.0,
+            12.0 + marker_pop,
             egui::Stroke::new(2.0, visuals.extreme_bg_color),
         );
         painter.text(
@@ -2287,6 +2297,12 @@ fn arc_motion_position(
     if at_end { 1.0 - progress } else { progress }
 }
 
+fn arc_endpoint_pop(elapsed_seconds: f64) -> f32 {
+    const POP_DURATION_SECONDS: f64 = 0.14;
+    let progress = (elapsed_seconds / POP_DURATION_SECONDS).clamp(0.0, 1.0) as f32;
+    (1.0 - progress).powi(2)
+}
+
 impl eframe::App for MetronomeApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_audio_events(ctx);
@@ -2430,7 +2446,10 @@ fn diagnostics_grid(ui: &mut egui::Ui, lang: Language, diagnostics: AudioDiagnos
 
 #[cfg(test)]
 mod tests {
-    use super::{ARC_SWEEP_ANGLE, arc_motion_position, normalize_beat_unit, unique_preset_name};
+    use super::{
+        ARC_SWEEP_ANGLE, arc_endpoint_pop, arc_motion_position, normalize_beat_unit,
+        unique_preset_name,
+    };
     use crate::config::BpmPreset;
 
     #[test]
@@ -2448,6 +2467,14 @@ mod tests {
     #[test]
     fn arc_motion_uses_a_270_degree_path() {
         assert!((ARC_SWEEP_ANGLE.to_degrees() - 270.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn arc_marker_pop_is_brief_and_decays_from_the_endpoint() {
+        assert!((arc_endpoint_pop(0.0) - 1.0).abs() < 0.0001);
+        assert!((arc_endpoint_pop(0.07) - 0.25).abs() < 0.0001);
+        assert_eq!(arc_endpoint_pop(0.14), 0.0);
+        assert_eq!(arc_endpoint_pop(1.0), 0.0);
     }
 
     #[test]
