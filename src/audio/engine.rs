@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -6,14 +7,19 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample, Stream, StreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 use thiserror::Error;
 
-use crate::audio::sample_bank::{SampleBank, SampleBankError};
-use crate::audio::scheduler::{BeatEvent, BeatScheduler};
+use crate::audio::sample_bank::{SampleBank, SampleBankError, TransientAnalysis};
+use crate::audio::scheduler::{
+    BeatEvent, BeatScheduler, SwingGrid as SchedulerSwingGrid, SwingSettings,
+};
 use crate::config::{
-    AppConfig, BPM_MAX, BPM_MIN, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS, OUTPUT_VOLUME_DB_MAX,
-    OUTPUT_VOLUME_DB_MIN,
+    AppConfig, BEAT_UNIT_MAX, BEAT_UNIT_MIN, BPM_MAX, BPM_MIN, CLICK_OFFSET_MAX_MS,
+    CLICK_OFFSET_MIN_MS, OUTPUT_VOLUME_DB_MAX, OUTPUT_VOLUME_DB_MIN, SWING_AMOUNT_MAX,
+    SWING_AMOUNT_MIN, SoundTimingSettings, SwingGrid as ConfigSwingGrid,
 };
 
-const MAX_VOICES: usize = 16;
+const MAX_VOICES: usize = 64;
+const MAX_SCHEDULED_EVENTS: usize = 128;
+const SOURCE_OFFSET_LOOKAHEAD_MS: u64 = CLICK_OFFSET_MAX_MS as u64;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AudioEvent {
@@ -52,6 +58,7 @@ pub struct AudioEngine {
     diagnostics: Arc<DiagnosticsShared>,
     event_consumer: Consumer<AudioEvent>,
     info: StreamInfo,
+    transient_analyses: [TransientAnalysis; 3],
 }
 
 impl AudioEngine {
@@ -66,6 +73,11 @@ impl AudioEngine {
         let sample_rate = stream_config.sample_rate;
         let channels = stream_config.channels;
         let sample_bank = SampleBank::from_config(config, sample_rate)?;
+        let transient_analyses = [
+            sample_bank.normal_transient,
+            sample_bank.accent_transient,
+            sample_bank.subdivision_transient,
+        ];
         let (event_producer, event_consumer) = RingBuffer::<AudioEvent>::new(256);
 
         let shared = Arc::new(AudioShared::from_config(config));
@@ -141,6 +153,7 @@ impl AudioEngine {
             diagnostics,
             event_consumer,
             info,
+            transient_analyses,
         })
     }
 
@@ -188,19 +201,32 @@ impl AudioEngine {
             .beats_per_bar
             .store(u32::from(beats_per_bar.clamp(1, 16)), Ordering::Relaxed);
         self.shared.beat_unit.store(
-            u32::from(match beat_unit {
-                2 | 4 | 8 | 16 => beat_unit,
-                _ => 4,
-            }),
+            u32::from(beat_unit.clamp(BEAT_UNIT_MIN, BEAT_UNIT_MAX)),
             Ordering::Relaxed,
         );
     }
 
-    pub fn set_click_timing_offset_ms(&self, offset_ms: i32) {
-        self.shared.click_offset_ms.store(
-            offset_ms.clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS),
+    pub fn set_swing(&self, grid: ConfigSwingGrid, amount_percent: i16) {
+        self.shared
+            .swing_grid
+            .store(swing_grid_code(grid), Ordering::Relaxed);
+        self.shared.swing_amount_percent.store(
+            i32::from(amount_percent.clamp(SWING_AMOUNT_MIN, SWING_AMOUNT_MAX)),
             Ordering::Relaxed,
         );
+    }
+
+    pub fn set_source_timing(
+        &self,
+        normal: SoundTimingSettings,
+        accent: SoundTimingSettings,
+        subdivision: SoundTimingSettings,
+    ) {
+        self.shared.set_source_timing([normal, accent, subdivision]);
+    }
+
+    pub fn transient_analyses(&self) -> [TransientAnalysis; 3] {
+        self.transient_analyses
     }
 
     pub fn set_subdivision(&self, subdivision: u8) {
@@ -261,13 +287,27 @@ struct AudioShared {
     subdivision_gain_bits: AtomicU32,
     beats_per_bar: AtomicU32,
     beat_unit: AtomicU32,
-    click_offset_ms: AtomicI32,
     subdivision: AtomicU32,
     accent_enabled: AtomicBool,
+    swing_grid: AtomicU32,
+    swing_amount_percent: AtomicI32,
+    normal_offset_ms: AtomicI32,
+    accent_offset_ms: AtomicI32,
+    subdivision_offset_ms: AtomicI32,
+    normal_auto_align: AtomicBool,
+    accent_auto_align: AtomicBool,
+    subdivision_auto_align: AtomicBool,
 }
 
 impl AudioShared {
     fn from_config(config: &AppConfig) -> Self {
+        let timing = [
+            config.sound.timing_for(&config.sound.normal_source_id()),
+            config.sound.timing_for(&config.sound.accent_source_id()),
+            config
+                .sound
+                .timing_for(&config.sound.subdivision_source_id()),
+        ];
         Self {
             running: AtomicBool::new(false),
             bpm_milli: AtomicU32::new(config.bpm_milli.clamp(BPM_MIN, BPM_MAX)),
@@ -287,15 +327,69 @@ impl AudioShared {
                 config.time_signature.beats_per_bar.clamp(1, 16),
             )),
             beat_unit: AtomicU32::new(u32::from(config.time_signature.beat_unit)),
-            click_offset_ms: AtomicI32::new(
-                config
-                    .audio
-                    .click_timing_offset_ms
-                    .clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS),
-            ),
             subdivision: AtomicU32::new(u32::from(config.audio.subdivision.clamp(1, 8))),
             accent_enabled: AtomicBool::new(config.sound.accent_enabled),
+            swing_grid: AtomicU32::new(swing_grid_code(config.audio.swing.grid)),
+            swing_amount_percent: AtomicI32::new(i32::from(
+                config
+                    .audio
+                    .swing
+                    .amount_percent
+                    .clamp(SWING_AMOUNT_MIN, SWING_AMOUNT_MAX),
+            )),
+            normal_offset_ms: AtomicI32::new(timing[0].manual_offset_ms),
+            accent_offset_ms: AtomicI32::new(timing[1].manual_offset_ms),
+            subdivision_offset_ms: AtomicI32::new(timing[2].manual_offset_ms),
+            normal_auto_align: AtomicBool::new(timing[0].auto_align_transient),
+            accent_auto_align: AtomicBool::new(timing[1].auto_align_transient),
+            subdivision_auto_align: AtomicBool::new(timing[2].auto_align_transient),
         }
+    }
+
+    fn set_source_timing(&self, settings: [SoundTimingSettings; 3]) {
+        for (offset, auto, setting) in [
+            (&self.normal_offset_ms, &self.normal_auto_align, settings[0]),
+            (&self.accent_offset_ms, &self.accent_auto_align, settings[1]),
+            (
+                &self.subdivision_offset_ms,
+                &self.subdivision_auto_align,
+                settings[2],
+            ),
+        ] {
+            offset.store(
+                setting
+                    .manual_offset_ms
+                    .clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS),
+                Ordering::Relaxed,
+            );
+            auto.store(setting.auto_align_transient, Ordering::Relaxed);
+        }
+    }
+
+    fn timing_for_sample(&self, sample: VoiceSample) -> (i32, bool) {
+        match sample {
+            VoiceSample::Normal => (
+                self.normal_offset_ms.load(Ordering::Relaxed),
+                self.normal_auto_align.load(Ordering::Relaxed),
+            ),
+            VoiceSample::Accent => (
+                self.accent_offset_ms.load(Ordering::Relaxed),
+                self.accent_auto_align.load(Ordering::Relaxed),
+            ),
+            VoiceSample::Subdivision => (
+                self.subdivision_offset_ms.load(Ordering::Relaxed),
+                self.subdivision_auto_align.load(Ordering::Relaxed),
+            ),
+        }
+    }
+
+    fn swing(&self) -> SwingSettings {
+        SwingSettings::new(
+            scheduler_swing_grid(self.swing_grid.load(Ordering::Relaxed)),
+            self.swing_amount_percent
+                .load(Ordering::Relaxed)
+                .clamp(i32::from(SWING_AMOUNT_MIN), i32::from(SWING_AMOUNT_MAX)) as i16,
+        )
     }
 
     fn gain_for_sample(&self, sample: VoiceSample) -> f32 {
@@ -328,6 +422,12 @@ struct RenderState {
     was_running: bool,
     current_gain: f32,
     gain_step: f32,
+    sample_rate: u32,
+    lookahead_frames: u64,
+    output_frame: u64,
+    planning_frame: u64,
+    scheduled_voices: Vec<ScheduledVoice>,
+    scheduled_visuals: VecDeque<ScheduledVisual>,
 }
 
 impl RenderState {
@@ -351,6 +451,12 @@ impl RenderState {
             was_running: false,
             current_gain,
             gain_step: 1.0 / (sample_rate as f32 * 0.005).max(1.0),
+            sample_rate,
+            lookahead_frames: u64::from(sample_rate) * SOURCE_OFFSET_LOOKAHEAD_MS / 1_000,
+            output_frame: 0,
+            planning_frame: 0,
+            scheduled_voices: Vec::with_capacity(MAX_SCHEDULED_EVENTS),
+            scheduled_visuals: VecDeque::with_capacity(MAX_SCHEDULED_EVENTS),
         }
     }
 
@@ -372,9 +478,11 @@ impl RenderState {
     fn render_frame(&mut self) -> f32 {
         let running = self.shared.running.load(Ordering::Relaxed);
         if running && !self.was_running {
-            self.scheduler.start();
+            self.start_scheduler();
         } else if !running && self.was_running {
             self.scheduler.stop();
+            self.scheduled_voices.clear();
+            self.scheduled_visuals.clear();
             for voice in &mut self.voices {
                 voice.active = false;
             }
@@ -382,39 +490,173 @@ impl RenderState {
         self.was_running = running;
 
         if running {
-            let bpm_milli = self.shared.bpm_milli.load(Ordering::Relaxed);
-            let beats_per_bar = self.shared.beats_per_bar.load(Ordering::Relaxed) as u8;
-            let beat_unit = self.shared.beat_unit.load(Ordering::Relaxed) as u8;
-            let click_offset_ms = self.shared.click_offset_ms.load(Ordering::Relaxed);
-            let subdivision = self.shared.subdivision.load(Ordering::Relaxed) as u8;
-            if let Some(beat) = self.scheduler.advance_frame(
-                bpm_milli,
-                beats_per_bar,
-                beat_unit,
-                subdivision,
-                click_offset_ms,
-            ) {
-                self.trigger_voice(beat);
+            if self.was_running {
+                self.plan_next_frame();
             }
+            self.trigger_due_voices();
+            self.emit_due_visuals();
+            self.output_frame = self.output_frame.saturating_add(1);
         }
 
         self.advance_gain();
         (self.mix_voices() * self.current_gain).clamp(-1.0, 1.0)
     }
 
-    fn trigger_voice(&mut self, beat: BeatEvent) {
+    fn start_scheduler(&mut self) {
+        self.scheduler.start();
+        self.output_frame = 0;
+        self.planning_frame = 0;
+        self.scheduled_voices.clear();
+        self.scheduled_visuals.clear();
+        while self.planning_frame <= self.lookahead_frames {
+            self.plan_next_frame();
+        }
+    }
+
+    fn plan_next_frame(&mut self) {
+        let bpm_milli = self.shared.bpm_milli.load(Ordering::Relaxed);
+        let beats_per_bar = self.shared.beats_per_bar.load(Ordering::Relaxed) as u8;
+        let beat_unit = self.shared.beat_unit.load(Ordering::Relaxed) as u8;
+        let subdivision = self.shared.subdivision.load(Ordering::Relaxed) as u8;
+        let mut beats = [None; MAX_SCHEDULED_EVENTS];
+        let mut beat_count = 0;
+        let mut overflowed = false;
+        self.scheduler.advance_frame(
+            bpm_milli,
+            beats_per_bar,
+            beat_unit,
+            subdivision,
+            self.shared.swing(),
+            |beat| {
+                if let Some(slot) = beats.get_mut(beat_count) {
+                    *slot = Some(beat);
+                    beat_count += 1;
+                } else {
+                    overflowed = true;
+                }
+            },
+        );
+        if overflowed {
+            self.diagnostics.event_drops.fetch_add(1, Ordering::Relaxed);
+        }
+        for beat in beats.into_iter().take(beat_count).flatten() {
+            self.schedule_event(self.planning_frame, beat);
+        }
+        self.planning_frame = self.planning_frame.saturating_add(1);
+    }
+
+    fn schedule_event(&mut self, rhythmic_frame: u64, beat: BeatEvent) {
+        if self.scheduled_visuals.len() == MAX_SCHEDULED_EVENTS {
+            self.scheduled_visuals.pop_front();
+            self.diagnostics.event_drops.fetch_add(1, Ordering::Relaxed);
+        }
+        self.scheduled_visuals.push_back(ScheduledVisual {
+            due_frame: rhythmic_frame,
+            beat,
+        });
+
+        let accent_enabled = self.shared.accent_enabled.load(Ordering::Relaxed);
+        let sample = voice_sample_for_beat(beat, accent_enabled);
+        let offset_frames = self.effective_offset_frames(sample);
+        let due_frame = if offset_frames < 0 {
+            let advance = offset_frames.unsigned_abs();
+            if advance >= rhythmic_frame {
+                // Keep the first downbeat immediate, but do not collapse the
+                // rest of the negative pre-roll into a burst at frame zero.
+                if rhythmic_frame == 0 {
+                    0
+                } else {
+                    return;
+                }
+            } else {
+                rhythmic_frame - advance
+            }
+        } else {
+            rhythmic_frame.saturating_add(offset_frames as u64)
+        };
+
+        if self.scheduled_voices.len() == MAX_SCHEDULED_EVENTS {
+            self.diagnostics.voice_drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let insert_at = self
+            .scheduled_voices
+            .partition_point(|scheduled| scheduled.due_frame <= due_frame);
+        self.scheduled_voices
+            .insert(insert_at, ScheduledVoice { due_frame, sample });
+    }
+
+    fn effective_offset_frames(&self, sample: VoiceSample) -> i64 {
+        let (manual_ms, auto_align) = self.shared.timing_for_sample(sample);
+        let manual_frames = i64::from(manual_ms) * i64::from(self.sample_rate) / 1_000;
+        let transient_frames = if auto_align {
+            let analysis = self.transient_for_sample(sample);
+            if analysis.reliable {
+                analysis
+                    .frame
+                    .and_then(|frame| i64::try_from(frame).ok())
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        (manual_frames - transient_frames).clamp(
+            -(self.lookahead_frames as i64),
+            self.lookahead_frames as i64,
+        )
+    }
+
+    fn transient_for_sample(&self, sample: VoiceSample) -> TransientAnalysis {
+        match sample {
+            VoiceSample::Normal => self.sample_bank.normal_transient,
+            VoiceSample::Accent => self.sample_bank.accent_transient,
+            VoiceSample::Subdivision => self.sample_bank.subdivision_transient,
+        }
+    }
+
+    fn trigger_due_voices(&mut self) {
+        while self
+            .scheduled_voices
+            .first()
+            .is_some_and(|scheduled| scheduled.due_frame <= self.output_frame)
+        {
+            let scheduled = self.scheduled_voices.remove(0);
+            self.trigger_voice(scheduled.sample);
+        }
+    }
+
+    fn emit_due_visuals(&mut self) {
+        while self
+            .scheduled_visuals
+            .front()
+            .is_some_and(|scheduled| scheduled.due_frame <= self.output_frame)
+        {
+            let scheduled = self
+                .scheduled_visuals
+                .pop_front()
+                .expect("front was checked");
+            if self
+                .event_producer
+                .push(AudioEvent {
+                    beat: scheduled.beat,
+                })
+                .is_err()
+            {
+                self.diagnostics.event_drops.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn trigger_voice(&mut self, sample: VoiceSample) {
         if let Some(voice) = self.voices.iter_mut().find(|voice| !voice.active) {
             voice.active = true;
             voice.position = 0;
-            let accent_enabled = self.shared.accent_enabled.load(Ordering::Relaxed);
-            voice.sample = voice_sample_for_beat(beat, accent_enabled);
+            voice.sample = sample;
             voice.gain = self.shared.gain_for_sample(voice.sample);
         } else {
             self.diagnostics.voice_drops.fetch_add(1, Ordering::Relaxed);
-        }
-
-        if self.event_producer.push(AudioEvent { beat }).is_err() {
-            self.diagnostics.event_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -454,6 +696,18 @@ impl RenderState {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ScheduledVoice {
+    due_frame: u64,
+    sample: VoiceSample,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ScheduledVisual {
+    due_frame: u64,
+    beat: BeatEvent,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Voice {
     active: bool,
@@ -477,6 +731,22 @@ fn voice_sample_for_beat(beat: BeatEvent, accent_enabled: bool) -> VoiceSample {
         VoiceSample::Subdivision
     } else {
         VoiceSample::Normal
+    }
+}
+
+fn swing_grid_code(grid: ConfigSwingGrid) -> u32 {
+    match grid {
+        ConfigSwingGrid::Quarter => 4,
+        ConfigSwingGrid::Eighth => 8,
+        ConfigSwingGrid::Sixteenth => 16,
+    }
+}
+
+fn scheduler_swing_grid(code: u32) -> SchedulerSwingGrid {
+    match code {
+        4 => SchedulerSwingGrid::Quarter,
+        16 => SchedulerSwingGrid::Sixteenth,
+        _ => SchedulerSwingGrid::Eighth,
     }
 }
 
@@ -521,8 +791,47 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{VoiceSample, db_to_gain, output_volume_gain, percent_gain, voice_sample_for_beat};
+    use std::sync::Arc;
+
+    use rtrb::RingBuffer;
+
+    use super::{
+        AudioEvent, AudioShared, DiagnosticsShared, RenderState, VoiceSample, db_to_gain,
+        output_volume_gain, percent_gain, voice_sample_for_beat,
+    };
     use crate::audio::BeatEvent;
+    use crate::audio::sample_bank::{SampleBank, TransientAnalysis};
+    use crate::config::{AppConfig, SoundConfig, SoundTimingSettings, SwingGrid};
+
+    fn fast_config() -> AppConfig {
+        AppConfig {
+            bpm_milli: 600_000,
+            sound: SoundConfig {
+                accent_enabled: false,
+                ..SoundConfig::default()
+            },
+            ..AppConfig::default()
+        }
+    }
+
+    fn render_state(config: &AppConfig, normal_transient: TransientAnalysis) -> RenderState {
+        let (producer, _consumer) = RingBuffer::<AudioEvent>::new(256);
+        RenderState::new(
+            48_000,
+            2,
+            Arc::new(AudioShared::from_config(config)),
+            Arc::new(DiagnosticsShared::default()),
+            producer,
+            SampleBank {
+                normal: vec![1.0],
+                accent: vec![1.0],
+                subdivision: vec![1.0],
+                normal_transient,
+                accent_transient: TransientAnalysis::default(),
+                subdivision_transient: TransientAnalysis::default(),
+            },
+        )
+    }
 
     #[test]
     fn sound_percent_and_output_volume_are_independent_gain_stages() {
@@ -553,6 +862,108 @@ mod tests {
         assert_eq!(
             voice_sample_for_beat(subdivision, false),
             VoiceSample::Subdivision
+        );
+    }
+
+    #[test]
+    fn source_offset_moves_audio_without_moving_visual_events() {
+        let mut config = fast_config();
+        let source = config.sound.normal_source_id();
+        config.sound.set_timing_for(
+            source,
+            SoundTimingSettings {
+                manual_offset_ms: 100,
+                auto_align_transient: false,
+            },
+        );
+        let mut state = render_state(&config, TransientAnalysis::default());
+
+        state.start_scheduler();
+
+        assert_eq!(state.scheduled_visuals.front().unwrap().due_frame, 0);
+        assert_eq!(state.scheduled_voices.first().unwrap().due_frame, 4_800);
+    }
+
+    #[test]
+    fn negative_preroll_does_not_stack_future_clicks_at_start() {
+        let mut config = fast_config();
+        let source = config.sound.normal_source_id();
+        config.sound.set_timing_for(
+            source,
+            SoundTimingSettings {
+                manual_offset_ms: -100,
+                auto_align_transient: false,
+            },
+        );
+        let mut state = render_state(&config, TransientAnalysis::default());
+
+        state.start_scheduler();
+
+        assert_eq!(
+            state
+                .scheduled_voices
+                .iter()
+                .filter(|scheduled| scheduled.due_frame == 0)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn automatic_alignment_subtracts_detected_transient_position() {
+        let mut config = fast_config();
+        let source = config.sound.normal_source_id();
+        config.sound.set_timing_for(
+            source,
+            SoundTimingSettings {
+                manual_offset_ms: 0,
+                auto_align_transient: true,
+            },
+        );
+        let mut state = render_state(
+            &config,
+            TransientAnalysis {
+                frame: Some(1_440),
+                milliseconds: Some(30.0),
+                reliable: true,
+            },
+        );
+
+        state.start_scheduler();
+
+        assert!(
+            state
+                .scheduled_voices
+                .iter()
+                .any(|scheduled| scheduled.due_frame == 3_360)
+        );
+    }
+
+    #[test]
+    fn fully_swung_clicks_are_scheduled_on_the_same_audio_frame() {
+        let mut config = fast_config();
+        config.audio.subdivision = 2;
+        config.audio.swing.grid = SwingGrid::Eighth;
+        config.audio.swing.amount_percent = 100;
+        let mut state = render_state(&config, TransientAnalysis::default());
+
+        state.start_scheduler();
+
+        assert_eq!(
+            state
+                .scheduled_voices
+                .iter()
+                .filter(|scheduled| scheduled.due_frame == 4_800)
+                .count(),
+            2
+        );
+        assert_eq!(
+            state
+                .scheduled_visuals
+                .iter()
+                .filter(|scheduled| scheduled.due_frame == 4_800)
+                .count(),
+            2
         );
     }
 }
