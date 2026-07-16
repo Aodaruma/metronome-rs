@@ -1103,7 +1103,7 @@ impl MetronomeApp {
                     .checkbox(&mut always_on_top, tr(lang, "常に最前面", "Always on top"))
                     .changed()
                 {
-                    self.set_always_on_top(ctx, always_on_top);
+                    self.handle_menu_command(MenuCommand::ToggleAlwaysOnTop, ctx);
                 }
                 ui.separator();
                 if ui
