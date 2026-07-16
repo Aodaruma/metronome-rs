@@ -2377,7 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "metronome-rs"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "auto-launch",
  "cpal",
