@@ -41,6 +41,12 @@ pub struct NativeMenu {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     _menu: muda::Menu,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
+    localized_items: Vec<(muda::MenuItem, &'static str, &'static str)>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    localized_check_items: Vec<(muda::CheckMenuItem, &'static str, &'static str)>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    localized_submenus: Vec<(muda::Submenu, &'static str, &'static str)>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     toggle_playback: muda::MenuItem,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     bpm_up: muda::MenuItem,
@@ -446,9 +452,102 @@ mod native {
             ])
             .map_err(|error| error.to_string())?;
 
+            let localized_items = vec![
+                (save_settings, "設定を保存", "Save settings"),
+                (
+                    choose_normal_sound,
+                    "通常クリック音を選択…",
+                    "Choose normal click sound…",
+                ),
+                (
+                    choose_accent_sound,
+                    "アクセント音を選択…",
+                    "Choose accent sound…",
+                ),
+                (
+                    reset_sounds,
+                    "クリック音を内蔵音へ戻す",
+                    "Reset click sounds",
+                ),
+                (quit, "終了", "Quit"),
+                (reset_bpm, "BPMを120に戻す", "Reset BPM to 120"),
+                (volume_up, "音量 +5%", "Volume +5%"),
+                (volume_down, "音量 -5%", "Volume -5%"),
+                (beats_up, "拍数 +1", "Beats +1"),
+                (beats_down, "拍数 -1", "Beats -1"),
+                (
+                    cycle_beat_unit,
+                    "分母を切り替え（2 / 4 / 8 / 16）",
+                    "Cycle beat unit (2 / 4 / 8 / 16)",
+                ),
+                (
+                    save_preset,
+                    "現在のBPMをプリセット保存",
+                    "Save current BPM as preset",
+                ),
+                (show_presets, "プリセットを管理…", "Manage presets…"),
+                (show_metronome, "メトロノーム", "Metronome"),
+                (show_preferences, "環境設定", "Preferences"),
+                (about, "metronome-rsについて…", "About metronome-rs…"),
+                (
+                    shortcut_settings,
+                    "ショートカット設定…",
+                    "Shortcut settings…",
+                ),
+            ];
+            let localized_check_items = vec![
+                (always_on_top.clone(), "常に最前面", "Always on top"),
+                (meter_arc.clone(), "円弧モード", "Arc mode"),
+                (meter_beat_ring.clone(), "円形モード", "Beat-ring mode"),
+                (
+                    theme_system.clone(),
+                    "テーマ: システム設定",
+                    "Theme: System",
+                ),
+                (theme_dark.clone(), "テーマ: ダーク", "Theme: Dark"),
+                (theme_light.clone(), "テーマ: ライト", "Theme: Light"),
+                (
+                    language_system.clone(),
+                    "言語: システム設定",
+                    "Language: System",
+                ),
+                (
+                    language_japanese.clone(),
+                    "言語: 日本語",
+                    "Language: Japanese",
+                ),
+                (
+                    language_english.clone(),
+                    "言語: English",
+                    "Language: English",
+                ),
+            ];
+            #[cfg(target_os = "windows")]
+            let localized_submenus = vec![
+                (file_menu, "ファイル", "File"),
+                (playback_menu, "再生", "Playback"),
+                (signature_menu, "拍子", "Time signature"),
+                (presets_menu, "プリセット", "Presets"),
+                (view_menu, "表示", "View"),
+                (shortcuts_menu, "ショートカット", "Shortcuts"),
+                (help_menu, "ヘルプ", "Help"),
+            ];
+            #[cfg(target_os = "macos")]
+            let localized_submenus = vec![
+                (playback_menu, "再生", "Playback"),
+                (signature_menu, "拍子", "Time signature"),
+                (presets_menu, "プリセット", "Presets"),
+                (view_menu, "表示", "View"),
+                (shortcuts_menu, "ショートカット", "Shortcuts"),
+                (help_menu, "ヘルプ", "Help"),
+            ];
+
             attach_native_menu(&menu, cc)?;
             Ok(Self {
                 _menu: menu,
+                localized_items,
+                localized_check_items,
+                localized_submenus,
                 toggle_playback,
                 bpm_up,
                 bpm_down,
@@ -504,6 +603,15 @@ mod native {
             shortcuts: &ShortcutConfig,
             background: &BackgroundConfig,
         ) {
+            for (item, japanese, english) in &self.localized_items {
+                item.set_text(label(language, japanese, english));
+            }
+            for (item, japanese, english) in &self.localized_check_items {
+                item.set_text(label(language, japanese, english));
+            }
+            for (submenu, japanese, english) in &self.localized_submenus {
+                submenu.set_text(label(language, japanese, english));
+            }
             self.toggle_playback.set_text(shortcut_label(
                 language,
                 "再生 / 一時停止",
