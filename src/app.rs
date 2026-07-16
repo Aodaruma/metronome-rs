@@ -1,13 +1,21 @@
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::Duration;
 
 use eframe::egui;
 
-use crate::audio::{AudioDiagnostics, AudioEngine, BeatEvent, validate_audio_file};
+use crate::audio::{
+    AudioDiagnostics, AudioEngine, BeatEvent, TransientAnalysis, validate_audio_file,
+};
 use crate::config::{
-    AppConfig, BPM_MAX, BPM_MIN, BpmPreset, BuiltinSound, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS,
-    CloseBehavior, DRAG_SENSITIVITY_MAX, DRAG_SENSITIVITY_MIN, Language, LanguageMode, MeterMode,
-    OUTPUT_VOLUME_DB_MAX, OUTPUT_VOLUME_DB_MIN, SoundConfig, ThemeMode, load_config, save_config,
+    AppConfig, BEAT_UNIT_MAX, BEAT_UNIT_MIN, BPM_MAX, BPM_MIN, BpmPreset, BuiltinSound,
+    CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS, CloseBehavior, DRAG_SENSITIVITY_MAX,
+    DRAG_SENSITIVITY_MIN, Language, LanguageMode, MeterMode, OUTPUT_VOLUME_DB_MAX,
+    OUTPUT_VOLUME_DB_MIN, SWING_AMOUNT_MAX, SWING_AMOUNT_MIN, SoundConfig, SoundSourceId,
+    SoundTimingSettings, SwingGrid, ThemeMode, load_config, save_config,
 };
 use crate::fonts::install_japanese_font;
 use crate::menu::{MenuCommand, NativeMenu};
@@ -17,6 +25,18 @@ use crate::theme;
 
 const PRESET_SIDEBAR_WIDTH: f32 = 310.0;
 const PRESET_SIDEBAR_GAP: f32 = 16.0;
+const NORMAL_LAYOUT_MIN_SIZE: egui::Vec2 = egui::vec2(420.0, 560.0);
+const COMPACT_WINDOW_MIN_SIZE: egui::Vec2 = egui::vec2(240.0, 300.0);
+const COMPACT_PLAYBACK_SIZE: egui::Vec2 = egui::vec2(170.0, 54.0);
+const COMPACT_CONTENT_GAP: f32 = 6.0;
+const COMPACT_BOTTOM_PADDING: f32 = 12.0;
+const BACKGROUND_IMAGE_MAX_DECODE_DIMENSION: u32 = 16_384;
+const BACKGROUND_IMAGE_MAX_TEXTURE_DIMENSION: u32 = 2_048;
+const BACKGROUND_IMAGE_BLUR_TEXTURE_MAX_DIMENSION: u32 = 768;
+const BACKGROUND_IMAGE_MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+const PREFERENCES_BACKGROUND_BLUR_SIGMA: f32 = 12.0;
+const NORMAL_BACKGROUND_BLUR_MAX_SIGMA: f32 = 24.0;
+const PREFERENCES_BACKGROUND_ALPHA: u8 = 150;
 const ARC_START_ANGLE: f32 = std::f32::consts::FRAC_PI_2 * 1.5;
 const ARC_SWEEP_ANGLE: f32 = std::f32::consts::TAU * 0.75;
 
@@ -31,6 +51,46 @@ enum SoundKind {
     Normal,
     Accent,
     Subdivision,
+}
+
+struct BackgroundImage {
+    regular: egui::TextureHandle,
+    normal_blurred: Option<egui::TextureHandle>,
+    preferences_blurred: egui::TextureHandle,
+    blur_source: image::RgbaImage,
+    size: egui::Vec2,
+}
+
+struct PreparedBackgroundImage {
+    regular: egui::ColorImage,
+    normal_blurred: Option<egui::ColorImage>,
+    preferences_blurred: egui::ColorImage,
+    blur_source: image::RgbaImage,
+    size: egui::Vec2,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackgroundLoadStage {
+    Opening,
+    Decoding,
+    Resizing,
+    Blurring,
+}
+
+enum BackgroundLoadMessage {
+    Stage(BackgroundLoadStage),
+    Finished(Result<PreparedBackgroundImage, String>),
+}
+
+struct PendingBackgroundLoad {
+    path: PathBuf,
+    persist_path: bool,
+    stage: BackgroundLoadStage,
+    receiver: Receiver<BackgroundLoadMessage>,
+}
+
+struct PendingBackgroundBlur {
+    receiver: Receiver<Option<egui::ColorImage>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,11 +114,16 @@ pub struct MetronomeApp {
     native_menu_error: Option<String>,
     platform: PlatformRuntime,
     platform_error: Option<String>,
+    background_image: Option<BackgroundImage>,
+    background_image_error: Option<String>,
+    pending_background_load: Option<PendingBackgroundLoad>,
+    pending_background_blur: Option<PendingBackgroundBlur>,
     tab: AppTab,
     last_beat: Option<BeatEvent>,
     last_beat_time: f64,
     last_accent_time: f64,
     last_primary_beat_time: f64,
+    last_primary_beat: Option<BeatEvent>,
     arc_at_end: bool,
     preset_name_draft: String,
     presets_sidebar_open: bool,
@@ -66,6 +131,7 @@ pub struct MetronomeApp {
     window_visible: bool,
     force_exit: bool,
     shortcut_capture: Option<ShortcutCaptureTarget>,
+    sound_drop_target: Option<SoundKind>,
 }
 
 impl MetronomeApp {
@@ -79,26 +145,23 @@ impl MetronomeApp {
         }
         install_japanese_font(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, config.theme, config.appearance.accent_rgb);
+        apply_window_level(&cc.egui_ctx, config.appearance.always_on_top);
 
         let (audio, audio_error) = match AudioEngine::new(&config) {
             Ok(engine) => (Some(engine), None),
             Err(err) => (None, Some(err.to_string())),
         };
         #[cfg(any(target_os = "windows", target_os = "macos"))]
-        let (native_menu, native_menu_error) = match NativeMenu::new(
-            cc,
-            config.language.resolve(),
-            &config.shortcuts,
-            &config.background,
-        ) {
-            Ok(menu) => (Some(menu), None),
-            Err(err) => (None, Some(err)),
-        };
+        let (native_menu, native_menu_error) =
+            match NativeMenu::new(cc, config.language.resolve(), &config) {
+                Ok(menu) => (Some(menu), None),
+                Err(err) => (None, Some(err)),
+            };
         #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let (native_menu, native_menu_error) = (None, None);
         let (platform, platform_error) = PlatformRuntime::new(&config.background);
 
-        Self {
+        let mut app = Self {
             config,
             audio,
             audio_error,
@@ -108,11 +171,16 @@ impl MetronomeApp {
             native_menu_error,
             platform,
             platform_error,
+            background_image: None,
+            background_image_error: None,
+            pending_background_load: None,
+            pending_background_blur: None,
             tab: AppTab::Metronome,
             last_beat: None,
             last_beat_time: 0.0,
             last_accent_time: -1.0,
             last_primary_beat_time: -1.0,
+            last_primary_beat: None,
             arc_at_end: false,
             preset_name_draft: String::new(),
             presets_sidebar_open: false,
@@ -120,7 +188,12 @@ impl MetronomeApp {
             window_visible: !start_hidden,
             force_exit: false,
             shortcut_capture: None,
+            sound_drop_target: None,
+        };
+        if let Some(path) = app.config.appearance.background_image_path.clone() {
+            app.start_background_image_load(path, false);
         }
+        app
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -166,11 +239,21 @@ impl MetronomeApp {
             self.last_beat_time = now;
             if event.beat.subdivision_index == 0 {
                 self.last_primary_beat_time = now;
+                self.last_primary_beat = Some(event.beat);
                 self.arc_at_end = !self.arc_at_end;
             }
             if event.beat.is_accent {
                 self.last_accent_time = now;
             }
+        }
+    }
+
+    fn clear_inactive_sound_drop_target(&mut self, ctx: &egui::Context) {
+        let drag_active = ctx.input(|input| {
+            !input.raw.hovered_files.is_empty() || !input.raw.dropped_files.is_empty()
+        });
+        if !drag_active {
+            self.sound_drop_target = None;
         }
     }
 
@@ -256,7 +339,14 @@ impl MetronomeApp {
                 self.set_presets_sidebar_open(ctx, true);
             }
             MenuCommand::ShowMetronome => self.tab = AppTab::Metronome,
-            MenuCommand::ShowPreferences => self.tab = AppTab::Preferences,
+            MenuCommand::ShowPreferences => {
+                self.set_presets_sidebar_open(ctx, false);
+                self.ensure_normal_window_size(ctx);
+                self.tab = AppTab::Preferences;
+            }
+            MenuCommand::ToggleAlwaysOnTop => {
+                self.set_always_on_top(ctx, !self.config.appearance.always_on_top)
+            }
             MenuCommand::MeterArc => self.set_meter_mode(MeterMode::Arc),
             MenuCommand::MeterBeatRing => self.set_meter_mode(MeterMode::Circle),
             MenuCommand::ThemeSystem => self.set_theme(ctx, ThemeMode::System),
@@ -367,15 +457,63 @@ impl MetronomeApp {
         self.persist_config();
     }
 
-    fn set_click_offset_ms(&mut self, offset_ms: i32) {
-        let next = offset_ms.clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS);
-        if self.config.audio.click_timing_offset_ms == next {
+    fn set_swing(&mut self, grid: SwingGrid, amount_percent: i16) {
+        let amount_percent = amount_percent.clamp(SWING_AMOUNT_MIN, SWING_AMOUNT_MAX);
+        if self.config.audio.swing.grid == grid
+            && self.config.audio.swing.amount_percent == amount_percent
+        {
             return;
         }
-        self.config.audio.click_timing_offset_ms = next;
+        self.config.audio.swing.grid = grid;
+        self.config.audio.swing.amount_percent = amount_percent;
         if let Some(audio) = &self.audio {
-            audio.set_click_timing_offset_ms(next);
+            audio.set_swing(grid, amount_percent);
         }
+        self.persist_config();
+    }
+
+    fn source_id_for_kind(&self, kind: SoundKind) -> SoundSourceId {
+        match kind {
+            SoundKind::Normal => self.config.sound.normal_source_id(),
+            SoundKind::Accent => self.config.sound.accent_source_id(),
+            SoundKind::Subdivision => self.config.sound.subdivision_source_id(),
+        }
+    }
+
+    fn transient_for_kind(&self, kind: SoundKind) -> TransientAnalysis {
+        let Some(audio) = &self.audio else {
+            return TransientAnalysis::default();
+        };
+        let analyses = audio.transient_analyses();
+        match kind {
+            SoundKind::Normal => analyses[0],
+            SoundKind::Accent => analyses[1],
+            SoundKind::Subdivision => analyses[2],
+        }
+    }
+
+    fn sync_source_timing(&self) {
+        let Some(audio) = &self.audio else { return };
+        audio.set_source_timing(
+            self.config
+                .sound
+                .timing_for(&self.config.sound.normal_source_id()),
+            self.config
+                .sound
+                .timing_for(&self.config.sound.accent_source_id()),
+            self.config
+                .sound
+                .timing_for(&self.config.sound.subdivision_source_id()),
+        );
+    }
+
+    fn set_source_timing(&mut self, kind: SoundKind, settings: SoundTimingSettings) {
+        let source = self.source_id_for_kind(kind);
+        if self.config.sound.timing_for(&source) == settings {
+            return;
+        }
+        self.config.sound.set_timing_for(source, settings);
+        self.sync_source_timing();
         self.persist_config();
     }
 
@@ -413,11 +551,41 @@ impl MetronomeApp {
     }
 
     fn set_meter_mode(&mut self, meter_mode: MeterMode) {
+        if let Some(native_menu) = &self.native_menu {
+            native_menu.update_meter_mode(meter_mode);
+        }
         if self.config.meter_mode == meter_mode {
             return;
         }
         self.config.meter_mode = meter_mode;
         self.persist_config();
+    }
+
+    fn set_always_on_top(&mut self, ctx: &egui::Context, always_on_top: bool) {
+        if self.config.appearance.always_on_top == always_on_top {
+            return;
+        }
+        self.config.appearance.always_on_top = always_on_top;
+        apply_window_level(ctx, always_on_top);
+        if let Some(native_menu) = &self.native_menu {
+            native_menu.update_always_on_top(always_on_top);
+        }
+        self.persist_config();
+    }
+
+    fn ensure_normal_window_size(&self, ctx: &egui::Context) {
+        let current_size = viewport_inner_size(ctx);
+        if let Some(current_size) = current_size {
+            let normal_size = egui::vec2(
+                current_size.x.max(NORMAL_LAYOUT_MIN_SIZE.x),
+                current_size.y.max(NORMAL_LAYOUT_MIN_SIZE.y),
+            );
+            if normal_size != current_size {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(normal_size));
+            }
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(NORMAL_LAYOUT_MIN_SIZE));
+        }
     }
 
     fn set_presets_sidebar_open(&mut self, ctx: &egui::Context, open: bool) {
@@ -426,31 +594,38 @@ impl MetronomeApp {
         }
         self.presets_sidebar_open = open;
 
-        let min_width = if open {
-            420.0 + PRESET_SIDEBAR_WIDTH + PRESET_SIDEBAR_GAP
+        let min_size = if open {
+            egui::vec2(
+                NORMAL_LAYOUT_MIN_SIZE.x + PRESET_SIDEBAR_WIDTH + PRESET_SIDEBAR_GAP,
+                NORMAL_LAYOUT_MIN_SIZE.y,
+            )
         } else {
-            420.0
+            COMPACT_WINDOW_MIN_SIZE
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-            min_width, 560.0,
-        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(min_size));
 
-        let current_size = ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()));
+        let current_size = viewport_inner_size(ctx);
         if let Some(current_size) = current_size {
             let width_delta = PRESET_SIDEBAR_WIDTH + PRESET_SIDEBAR_GAP;
-            let next_width = if open {
-                current_size.x + width_delta
+            let next_size = if open {
+                egui::vec2(
+                    (current_size.x + width_delta).max(min_size.x),
+                    current_size.y.max(min_size.y),
+                )
             } else {
-                (current_size.x - width_delta).max(420.0)
+                egui::vec2(
+                    (current_size.x - width_delta).max(COMPACT_WINDOW_MIN_SIZE.x),
+                    current_size.y.max(COMPACT_WINDOW_MIN_SIZE.y),
+                )
             };
-            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                next_width,
-                current_size.y,
-            )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(next_size));
         }
     }
 
     fn set_theme(&mut self, ctx: &egui::Context, theme: ThemeMode) {
+        if let Some(native_menu) = &self.native_menu {
+            native_menu.update_theme(theme);
+        }
         if self.config.theme == theme {
             return;
         }
@@ -466,6 +641,187 @@ impl MetronomeApp {
         self.config.appearance.accent_rgb = accent_rgb;
         theme::apply(ctx, self.config.theme, accent_rgb);
         self.persist_config();
+    }
+
+    fn choose_background_image(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(
+                "Image",
+                &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"],
+            )
+            .pick_file()
+        else {
+            return;
+        };
+        self.apply_background_image(path);
+    }
+
+    fn apply_background_image(&mut self, path: PathBuf) {
+        self.start_background_image_load(path, true);
+    }
+
+    fn start_background_image_load(&mut self, path: PathBuf, persist_path: bool) {
+        let (sender, receiver) = mpsc::channel();
+        let worker_path = path.clone();
+        let blur_percent = self.config.appearance.background_image_blur_percent;
+        let spawn_result = thread::Builder::new()
+            .name("background-image-loader".to_owned())
+            .spawn(move || {
+                let result = prepare_background_image(&worker_path, blur_percent, &sender);
+                let _ = sender.send(BackgroundLoadMessage::Finished(result));
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.background_image_error = None;
+                self.pending_background_blur = None;
+                self.pending_background_load = Some(PendingBackgroundLoad {
+                    path,
+                    persist_path,
+                    stage: BackgroundLoadStage::Opening,
+                    receiver,
+                });
+            }
+            Err(error) => {
+                self.background_image_error =
+                    Some(format!("画像読み込み処理を開始できませんでした: {error}"));
+            }
+        }
+    }
+
+    fn poll_background_image_tasks(&mut self, ctx: &egui::Context) {
+        let mut load_finished = None;
+        if let Some(pending) = &mut self.pending_background_load {
+            loop {
+                match pending.receiver.try_recv() {
+                    Ok(BackgroundLoadMessage::Stage(stage)) => pending.stage = stage,
+                    Ok(BackgroundLoadMessage::Finished(result)) => {
+                        load_finished = Some(result);
+                        break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        load_finished =
+                            Some(Err("画像読み込み処理が予期せず終了しました".to_owned()));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(result) = load_finished {
+            let pending = self
+                .pending_background_load
+                .take()
+                .expect("finished background load should be pending");
+            match result {
+                Ok(prepared) => {
+                    self.background_image = Some(upload_background_image(ctx, prepared));
+                    self.background_image_error = None;
+                    if pending.persist_path {
+                        self.config.appearance.background_image_path = Some(pending.path);
+                        self.persist_config();
+                    }
+                }
+                Err(error) => self.background_image_error = Some(error),
+            }
+        }
+
+        let blur_result = self.pending_background_blur.as_ref().and_then(|pending| {
+            match pending.receiver.try_recv() {
+                Ok(image) => Some(Ok(image)),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("背景画像のぼかし処理が予期せず終了しました".to_owned()))
+                }
+            }
+        });
+        if let Some(result) = blur_result {
+            self.pending_background_blur = None;
+            match result {
+                Ok(image) => {
+                    if let Some(background) = &mut self.background_image {
+                        background.normal_blurred = image.map(|image| {
+                            ctx.load_texture(
+                                "background_image_normal_blurred",
+                                image,
+                                egui::TextureOptions::LINEAR,
+                            )
+                        });
+                    }
+                    self.background_image_error = None;
+                }
+                Err(error) => self.background_image_error = Some(error),
+            }
+        }
+    }
+
+    fn start_background_blur_update(&mut self) {
+        self.pending_background_blur = None;
+        let blur_percent = self.config.appearance.background_image_blur_percent;
+        if blur_percent == 0 {
+            if let Some(background) = &mut self.background_image {
+                background.normal_blurred = None;
+            }
+            return;
+        }
+        let Some(source) = self
+            .background_image
+            .as_ref()
+            .map(|background| background.blur_source.clone())
+        else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let spawn_result = thread::Builder::new()
+            .name("background-blur-updater".to_owned())
+            .spawn(move || {
+                let blurred =
+                    image::imageops::blur(&source, normal_background_blur_sigma(blur_percent));
+                let _ = sender.send(Some(rgba_to_color_image(&blurred)));
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.background_image_error = None;
+                self.pending_background_blur = Some(PendingBackgroundBlur { receiver });
+            }
+            Err(error) => {
+                self.background_image_error =
+                    Some(format!("ぼかし処理を開始できませんでした: {error}"));
+            }
+        }
+    }
+
+    fn clear_background_image(&mut self) {
+        self.pending_background_load = None;
+        self.pending_background_blur = None;
+        self.background_image = None;
+        self.background_image_error = None;
+        self.config.appearance.background_image_path = None;
+        self.persist_config();
+    }
+
+    fn paint_background_image(&self, ui: &egui::Ui, preferences: bool) {
+        let Some(background) = &self.background_image else {
+            return;
+        };
+        let rect = ui.clip_rect();
+        let (texture, tint) = if preferences {
+            (
+                &background.preferences_blurred,
+                egui::Color32::from_white_alpha(PREFERENCES_BACKGROUND_ALPHA),
+            )
+        } else {
+            (
+                background
+                    .normal_blurred
+                    .as_ref()
+                    .unwrap_or(&background.regular),
+                egui::Color32::from_white_alpha(background_opacity_alpha(
+                    self.config.appearance.background_image_opacity_percent,
+                )),
+            )
+        };
+        let uv = cover_uv(background.size, rect.size());
+        ui.painter().image(texture.id(), rect, uv, tint);
     }
 
     fn sync_background_settings(&mut self) {
@@ -530,6 +886,10 @@ impl MetronomeApp {
             return;
         };
 
+        self.apply_sound_file(kind, path);
+    }
+
+    fn apply_sound_file(&mut self, kind: SoundKind, path: PathBuf) {
         if let Err(error) = validate_audio_file(&path) {
             self.audio_error = Some(error.to_string());
             return;
@@ -576,8 +936,10 @@ impl MetronomeApp {
     }
 
     fn reset_all_sound_files(&mut self) {
+        let timing_calibrations = std::mem::take(&mut self.config.sound.timing_calibrations);
         self.config.sound = SoundConfig {
             accent_enabled: self.config.sound.accent_enabled,
+            timing_calibrations,
             ..SoundConfig::default()
         };
         self.persist_config();
@@ -597,6 +959,9 @@ impl MetronomeApp {
     }
 
     fn set_language(&mut self, language: LanguageMode) {
+        if let Some(native_menu) = &self.native_menu {
+            native_menu.update_language(language);
+        }
         if self.config.language == language {
             return;
         }
@@ -732,6 +1097,13 @@ impl MetronomeApp {
                 }
                 if ui.button(tr(lang, "環境設定", "Preferences")).clicked() {
                     self.handle_menu_command(MenuCommand::ShowPreferences, ctx);
+                }
+                let mut always_on_top = self.config.appearance.always_on_top;
+                if ui
+                    .checkbox(&mut always_on_top, tr(lang, "常に最前面", "Always on top"))
+                    .changed()
+                {
+                    self.set_always_on_top(ctx, always_on_top);
                 }
                 ui.separator();
                 if ui
@@ -937,16 +1309,65 @@ impl MetronomeApp {
                 self.show_arc_meter(
                     ui,
                     meter_size,
-                    accent_pulse,
-                    subdivision_pulse,
-                    motion_ratio,
-                    endpoint_pop,
+                    ArcMeterState {
+                        accent_pulse,
+                        subdivision_pulse,
+                        motion_ratio,
+                        endpoint_pop,
+                        compact: false,
+                    },
                 );
             }
-            MeterMode::Circle => {
-                self.show_circle_meter(ui, meter_size, pulse, accent_pulse, subdivision_pulse)
-            }
+            MeterMode::Circle => self.show_circle_meter(
+                ui,
+                meter_size,
+                pulse,
+                accent_pulse,
+                subdivision_pulse,
+                false,
+            ),
         }
+    }
+
+    fn show_compact_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let layout = compact_layout(ui.available_size());
+        ui.spacing_mut().item_spacing.y = layout.gap;
+        ui.add_space(layout.top_padding);
+
+        let pulse = self.pulse_amount(ctx);
+        let accent_pulse = self.accent_pulse_amount(ctx);
+        let subdivision_pulse = self.subdivision_guide_pulse(ctx);
+        match self.config.meter_mode {
+            MeterMode::Arc => {
+                let motion_ratio = self.arc_motion_ratio(ctx);
+                let endpoint_pop = self.arc_endpoint_pop_amount(ctx);
+                self.show_arc_meter(
+                    ui,
+                    layout.meter_size,
+                    ArcMeterState {
+                        accent_pulse,
+                        subdivision_pulse,
+                        motion_ratio,
+                        endpoint_pop,
+                        compact: true,
+                    },
+                );
+            }
+            MeterMode::Circle => self.show_circle_meter(
+                ui,
+                layout.meter_size,
+                pulse,
+                accent_pulse,
+                subdivision_pulse,
+                true,
+            ),
+        }
+
+        centered_row(ui, layout.playback_size.x, layout.playback_size.y, |ui| {
+            let (rect, _) = ui.allocate_exact_size(layout.playback_size, egui::Sense::hover());
+            self.show_playback_button_at(ui, rect.center());
+        });
+        ui.add_space(layout.bottom_padding);
     }
 
     fn show_preferences(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -966,6 +1387,7 @@ impl MetronomeApp {
         let mut meter_mode = self.config.meter_mode;
         let mut accent_rgb = self.config.appearance.accent_rgb;
         let mut accent_center_flash = self.config.appearance.accent_center_flash;
+        let mut always_on_top = self.config.appearance.always_on_top;
         egui::Frame::group(ui.style())
             .corner_radius(8.0)
             .inner_margin(12.0)
@@ -1026,6 +1448,10 @@ impl MetronomeApp {
                                 }
                             });
                         ui.end_row();
+
+                        ui.label(tr(lang, "ウィンドウ", "Window"));
+                        ui.checkbox(&mut always_on_top, tr(lang, "常に最前面", "Always on top"));
+                        ui.end_row();
                     });
                 ui.add_space(6.0);
                 ui.separator();
@@ -1044,10 +1470,15 @@ impl MetronomeApp {
                     "中央の円がアクセントカラーから徐々に通常色へ戻ります。",
                     "The center fades from the accent color back to its normal color.",
                 ));
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                self.show_background_image_editor(ui, lang);
             });
         self.set_language(language);
         self.set_theme(ctx, theme);
         self.set_meter_mode(meter_mode);
+        self.set_always_on_top(ctx, always_on_top);
         self.set_accent_color(ctx, accent_rgb);
         if self.config.appearance.accent_center_flash != accent_center_flash {
             self.config.appearance.accent_center_flash = accent_center_flash;
@@ -1060,8 +1491,9 @@ impl MetronomeApp {
         let mut accent_volume = i32::from(self.config.sound.accent_volume_percent);
         let mut subdivision_volume = i32::from(self.config.sound.subdivision_volume_percent);
         let mut output_volume_db = self.config.audio.output_volume_db;
-        let mut offset_ms = self.config.audio.click_timing_offset_ms;
         let mut subdivision = self.config.audio.subdivision;
+        let mut swing_grid = self.config.audio.swing.grid;
+        let mut swing_amount = self.config.audio.swing.amount_percent;
         let mut accent_enabled = self.config.sound.accent_enabled;
         let mut sound_volume_changed = false;
         let mut output_volume_changed = false;
@@ -1104,41 +1536,29 @@ impl MetronomeApp {
                         "Use an accent sound at the start of each bar",
                     ),
                 );
-                self.show_sound_file_row(ui, lang, SoundKind::Normal);
-                sound_volume_changed |= ui
-                    .add(egui::Slider::new(&mut normal_volume, 0..=100).text(tr(
-                        lang,
-                        "通常音 音量 (%)",
-                        "Normal volume (%)",
-                    )))
-                    .changed();
-                self.show_sound_file_row(ui, lang, SoundKind::Accent);
-                sound_volume_changed |= ui
-                    .add(egui::Slider::new(&mut accent_volume, 0..=100).text(tr(
-                        lang,
-                        "アクセント 音量 (%)",
-                        "Accent volume (%)",
-                    )))
-                    .changed();
-                self.show_sound_file_row(ui, lang, SoundKind::Subdivision);
-                sound_volume_changed |= ui
-                    .add(egui::Slider::new(&mut subdivision_volume, 0..=100).text(tr(
-                        lang,
-                        "Subdivision 音量 (%)",
-                        "Subdivision volume (%)",
-                    )))
-                    .changed();
+                ui.add_space(8.0);
+                sound_volume_changed |= self.show_sound_section(
+                    ui,
+                    lang,
+                    SoundKind::Normal,
+                    &mut normal_volume,
+                );
+                ui.add_space(10.0);
+                sound_volume_changed |= self.show_sound_section(
+                    ui,
+                    lang,
+                    SoundKind::Accent,
+                    &mut accent_volume,
+                );
+                ui.add_space(10.0);
+                sound_volume_changed |= self.show_sound_section(
+                    ui,
+                    lang,
+                    SoundKind::Subdivision,
+                    &mut subdivision_volume,
+                );
                 ui.add_space(8.0);
                 ui.separator();
-                let response = ui.add(
-                    egui::Slider::new(&mut offset_ms, CLICK_OFFSET_MIN_MS..=CLICK_OFFSET_MAX_MS)
-                        .text(tr(lang, "発音オフセット (ms)", "Timing offset (ms)")),
-                );
-                response.on_hover_text(tr(
-                    lang,
-                    "負の値で音源を拍より前倒し、正の値で遅らせます。",
-                    "Negative values play before the beat; positive values play later.",
-                ));
                 ui.horizontal(|ui| {
                     ui.label(tr(lang, "Subdivision", "Subdivision"));
                     egui::ComboBox::from_id_salt("settings_subdivision")
@@ -1154,6 +1574,30 @@ impl MetronomeApp {
                             }
                         });
                 });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(tr(lang, "スイング単位", "Swing grid"));
+                    egui::ComboBox::from_id_salt("settings_swing_grid")
+                        .selected_text(swing_grid_label(swing_grid))
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for grid in
+                                [SwingGrid::Quarter, SwingGrid::Eighth, SwingGrid::Sixteenth]
+                            {
+                                ui.selectable_value(&mut swing_grid, grid, swing_grid_label(grid));
+                            }
+                        });
+                });
+                ui.add(
+                    egui::Slider::new(&mut swing_amount, SWING_AMOUNT_MIN..=SWING_AMOUNT_MAX)
+                        .suffix(" %")
+                        .text(tr(lang, "スイング量", "Swing amount")),
+                )
+                .on_hover_text(tr(
+                    lang,
+                    "0%はストレート、−100%は前の拍、+100%は次の拍と重なります。小節ごとにペアを組み直します。",
+                    "0% is straight; −100% overlaps the previous beat and +100% overlaps the next. Pairs restart each bar.",
+                ));
             });
         if sound_volume_changed {
             self.set_sound_volumes(
@@ -1165,11 +1609,13 @@ impl MetronomeApp {
         if output_volume_changed {
             self.set_output_volume_db(output_volume_db);
         }
-        if offset_ms != self.config.audio.click_timing_offset_ms {
-            self.set_click_offset_ms(offset_ms);
-        }
         if subdivision != self.config.audio.subdivision {
             self.set_subdivision(subdivision);
+        }
+        if swing_grid != self.config.audio.swing.grid
+            || swing_amount != self.config.audio.swing.amount_percent
+        {
+            self.set_swing(swing_grid, swing_amount);
         }
         if accent_enabled != self.config.sound.accent_enabled {
             self.set_accent_enabled(accent_enabled);
@@ -1229,6 +1675,114 @@ impl MetronomeApp {
             self.config.interaction.time_signature_drag_sensitivity = time_signature_sensitivity;
             self.persist_config();
         }
+    }
+
+    fn show_background_image_editor(&mut self, ui: &mut egui::Ui, lang: Language) {
+        let loading = self.pending_background_load.is_some();
+        ui.label(egui::RichText::new(tr(lang, "背景画像", "Background image")).strong());
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    !loading,
+                    egui::Button::new(tr(lang, "画像を選択…", "Choose image…")),
+                )
+                .clicked()
+            {
+                self.choose_background_image();
+            }
+            if ui
+                .add_enabled(
+                    self.config.appearance.background_image_path.is_some() || loading,
+                    egui::Button::new(tr(lang, "画像を解除", "Clear image")),
+                )
+                .clicked()
+            {
+                self.clear_background_image();
+            }
+        });
+        let displayed_path = self
+            .pending_background_load
+            .as_ref()
+            .map(|pending| &pending.path)
+            .or(self.config.appearance.background_image_path.as_ref());
+        match displayed_path {
+            Some(path) => {
+                let path = path.display().to_string();
+                ui.label(egui::RichText::new(&path).small().weak())
+                    .on_hover_text(path);
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new(tr(
+                        lang,
+                        "画像なし（テーマ色のみ）",
+                        "No image (theme color only)",
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+        }
+        if let Some(pending) = &self.pending_background_load {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(background_load_stage_label(lang, pending.stage));
+            });
+        } else if self.pending_background_blur.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(tr(
+                    lang,
+                    "通常画面用のぼかしを適用しています…",
+                    "Applying the metronome background blur…",
+                ));
+            });
+        }
+
+        let controls_enabled = self.background_image.is_some() && !loading;
+        let mut opacity = self.config.appearance.background_image_opacity_percent;
+        let mut blur = self.config.appearance.background_image_blur_percent;
+        let opacity_response = ui.add_enabled(
+            controls_enabled,
+            egui::Slider::new(&mut opacity, 0..=100)
+                .suffix(" %")
+                .text(tr(lang, "通常画面の不透明度", "Metronome opacity")),
+        );
+        let blur_response = ui
+            .add_enabled(
+                controls_enabled && self.pending_background_blur.is_none(),
+                egui::Slider::new(&mut blur, 0..=100).suffix(" %").text(tr(
+                    lang,
+                    "通常画面のぼかし",
+                    "Metronome blur",
+                )),
+            )
+            .on_hover_text(tr(
+                lang,
+                "0%でぼかしなし。ドラッグを離した時に適用します。",
+                "0% disables blur. Changes are applied when you release the slider.",
+            ));
+        let opacity_changed = opacity_response.changed();
+        let blur_changed = blur_response.changed();
+        let apply_blur = blur_response.drag_stopped() || (blur_changed && !blur_response.dragged());
+        if opacity_changed || blur_changed {
+            self.config.appearance.background_image_opacity_percent = opacity;
+            self.config.appearance.background_image_blur_percent = blur;
+            self.persist_config();
+        }
+        if apply_blur {
+            self.start_background_blur_update();
+        }
+        ui.label(
+            egui::RichText::new(tr(
+                lang,
+                "中央基準で画面全体を覆います。環境設定では通常画面の設定とは別に、薄くぼかして表示します。",
+                "Centered and cropped to cover the window. Preferences uses its own softened, dimmed presentation.",
+            ))
+            .small()
+            .weak(),
+        );
     }
 
     fn show_background_preferences(&mut self, ui: &mut egui::Ui, lang: Language) {
@@ -1505,16 +2059,181 @@ impl MetronomeApp {
         }
     }
 
+    fn show_sound_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        lang: Language,
+        kind: SoundKind,
+        volume_percent: &mut i32,
+    ) -> bool {
+        let mut volume_changed = false;
+        let card = egui::Frame::group(ui.style())
+            .corner_radius(8.0)
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new(sound_kind_label(lang, kind)).strong());
+                ui.add_space(6.0);
+                self.show_sound_file_row(ui, lang, kind);
+                ui.add_space(8.0);
+                volume_changed |= ui
+                    .add(egui::Slider::new(volume_percent, 0..=100).text(tr(
+                        lang,
+                        "音量 (%)",
+                        "Volume (%)",
+                    )))
+                    .changed();
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                self.show_sound_timing_controls(ui, lang, kind);
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(tr(
+                        lang,
+                        "WAV / FLAC / MP3 / OGGをここへドロップ",
+                        "Drop a WAV / FLAC / MP3 / OGG file here",
+                    ))
+                    .small()
+                    .weak(),
+                );
+            });
+
+        let (has_hovered_files, has_dropped_files, pointer_pos, dropped_path) =
+            ui.ctx().input(|input| {
+                (
+                    !input.raw.hovered_files.is_empty(),
+                    !input.raw.dropped_files.is_empty(),
+                    input.pointer.hover_pos(),
+                    input
+                        .raw
+                        .dropped_files
+                        .iter()
+                        .find_map(|file| file.path.clone()),
+                )
+            });
+        let pointer_inside =
+            pointer_pos.is_some_and(|position| card.response.rect.contains(position));
+        if has_hovered_files && pointer_inside {
+            self.sound_drop_target = Some(kind);
+            ui.painter().rect_stroke(
+                card.response.rect,
+                8.0,
+                egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                egui::StrokeKind::Inside,
+            );
+        }
+        if has_dropped_files
+            && sound_drop_matches(
+                kind,
+                self.sound_drop_target,
+                pointer_inside,
+                pointer_pos.is_some(),
+            )
+        {
+            self.sound_drop_target = None;
+            if let Some(path) = dropped_path {
+                self.apply_sound_file(kind, path);
+            }
+        }
+
+        volume_changed
+    }
+
+    fn show_sound_timing_controls(&mut self, ui: &mut egui::Ui, lang: Language, kind: SoundKind) {
+        let source = self.source_id_for_kind(kind);
+        let mut settings = self.config.sound.timing_for(&source);
+        let analysis = self.transient_for_kind(kind);
+        let shared_source = [
+            self.config.sound.normal_source_id(),
+            self.config.sound.accent_source_id(),
+            self.config.sound.subdivision_source_id(),
+        ]
+        .iter()
+        .filter(|candidate| **candidate == source)
+        .count()
+            > 1;
+        let mut changed = false;
+
+        ui.scope(|ui| {
+            changed |= ui
+                .add(
+                    egui::Slider::new(
+                        &mut settings.manual_offset_ms,
+                        CLICK_OFFSET_MIN_MS..=CLICK_OFFSET_MAX_MS,
+                    )
+                    .text(tr(lang, "音源オフセット (ms)", "Source offset (ms)")),
+                )
+                .on_hover_text(tr(
+                    lang,
+                    "負の値で前倒し、正の値で遅らせます。自動調整時は検出位置に対する微調整になります。",
+                    "Negative values play earlier and positive values later. With auto alignment, this fine-tunes the detected onset.",
+                ))
+                .changed();
+
+            let auto_available = analysis.reliable || settings.auto_align_transient;
+            changed |= ui
+                .add_enabled(
+                    auto_available,
+                    egui::Checkbox::new(
+                        &mut settings.auto_align_transient,
+                        tr(
+                            lang,
+                            "先頭トランジェントを自動で拍に合わせる",
+                            "Automatically align the first transient",
+                        ),
+                    ),
+                )
+                .on_disabled_hover_text(tr(
+                    lang,
+                    "明確な立ち上がりを検出できないため利用できません。",
+                    "Unavailable because no reliable onset was detected.",
+                ))
+                .changed();
+
+            if analysis.reliable {
+                let detected_ms = analysis.milliseconds.unwrap_or(0.0);
+                let correction_ms = if settings.auto_align_transient {
+                    detected_ms
+                } else {
+                    0.0
+                };
+                let effective_ms = (settings.manual_offset_ms as f32 - correction_ms)
+                    .clamp(CLICK_OFFSET_MIN_MS as f32, CLICK_OFFSET_MAX_MS as f32);
+                ui.small(match lang {
+                    Language::Japanese => {
+                        format!("検出位置: {detected_ms:.1} ms / 実効: {effective_ms:+.1} ms")
+                    }
+                    Language::English => format!(
+                        "Detected onset: {detected_ms:.1} ms / effective: {effective_ms:+.1} ms"
+                    ),
+                });
+            } else {
+                ui.small(tr(
+                    lang,
+                    "自動調整に使える明確な立ち上がりは検出されていません。",
+                    "No reliable onset was detected for automatic alignment.",
+                ));
+            }
+            if shared_source {
+                ui.small(tr(
+                    lang,
+                    "同じ音源を使う他のクリック種別と設定を共有します。",
+                    "Shared with other click roles that use the same source.",
+                ));
+            }
+        });
+
+        if changed {
+            self.set_source_timing(kind, settings);
+        }
+    }
+
     fn show_sound_file_row(&mut self, ui: &mut egui::Ui, lang: Language, kind: SoundKind) {
         let selected_path: Option<PathBuf> = match kind {
             SoundKind::Normal => self.config.sound.normal_path.clone(),
             SoundKind::Accent => self.config.sound.accent_path.clone(),
             SoundKind::Subdivision => self.config.sound.subdivision_path.clone(),
-        };
-        let label = match kind {
-            SoundKind::Normal => tr(lang, "通常音", "Normal"),
-            SoundKind::Accent => tr(lang, "アクセント", "Accent"),
-            SoundKind::Subdivision => "Subdivision",
         };
         let selected_builtin = match kind {
             SoundKind::Normal => Some(self.config.sound.normal_builtin),
@@ -1536,58 +2255,68 @@ impl MetronomeApp {
         let mut choose_clicked = false;
         let mut reset_clicked = false;
 
-        ui.horizontal(|ui| {
-            ui.add_sized([96.0, 24.0], egui::Label::new(label));
-            let combo = egui::ComboBox::from_id_salt(("builtin_sound", kind))
-                .selected_text(display_name)
-                .width(120.0)
-                .show_ui(ui, |ui| {
-                    if kind == SoundKind::Subdivision {
-                        builtin_changed |= ui
-                            .selectable_value(
-                                &mut builtin,
-                                None,
-                                tr(lang, "通常音を使用", "Use normal sound"),
-                            )
-                            .changed();
+        egui::Grid::new(("sound_source_grid", kind))
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(tr(lang, "音源", "Source"));
+                ui.horizontal_wrapped(|ui| {
+                    let combo = egui::ComboBox::from_id_salt(("builtin_sound", kind))
+                        .selected_text(display_name)
+                        .width(132.0)
+                        .show_ui(ui, |ui| {
+                            if kind == SoundKind::Subdivision {
+                                builtin_changed |= ui
+                                    .selectable_value(
+                                        &mut builtin,
+                                        None,
+                                        tr(lang, "通常音を使用", "Use normal sound"),
+                                    )
+                                    .changed();
+                            }
+                            for value in [
+                                BuiltinSound::Sin1,
+                                BuiltinSound::Sin2,
+                                BuiltinSound::Sin3,
+                                BuiltinSound::Sin4,
+                            ] {
+                                builtin_changed |= ui
+                                    .selectable_value(
+                                        &mut builtin,
+                                        Some(value),
+                                        builtin_sound_label(value),
+                                    )
+                                    .changed();
+                            }
+                        });
+                    if let Some(path) = &selected_path {
+                        combo.response.on_hover_text(path.display().to_string());
                     }
-                    for value in [
-                        BuiltinSound::Sin1,
-                        BuiltinSound::Sin2,
-                        BuiltinSound::Sin3,
-                        BuiltinSound::Sin4,
-                    ] {
-                        builtin_changed |= ui
-                            .selectable_value(&mut builtin, Some(value), builtin_sound_label(value))
-                            .changed();
-                    }
+                    choose_clicked = ui
+                        .button(tr(lang, "選択…", "Choose…"))
+                        .on_hover_text(tr(
+                            lang,
+                            "WAV、FLAC、MP3、OGGに対応",
+                            "Supports WAV, FLAC, MP3, and OGG",
+                        ))
+                        .clicked();
+                    reset_clicked = ui
+                        .add_enabled(
+                            selected_path.is_some(),
+                            egui::Button::new(match kind {
+                                SoundKind::Subdivision if selected_builtin.is_none() => {
+                                    tr(lang, "通常音に戻す", "Use normal")
+                                }
+                                SoundKind::Subdivision => tr(lang, "内蔵に戻す", "Use built-in"),
+                                SoundKind::Normal | SoundKind::Accent => {
+                                    tr(lang, "内蔵に戻す", "Use built-in")
+                                }
+                            }),
+                        )
+                        .clicked();
                 });
-            if let Some(path) = &selected_path {
-                combo.response.on_hover_text(path.display().to_string());
-            }
-            choose_clicked = ui
-                .button(tr(lang, "選択…", "Choose…"))
-                .on_hover_text(tr(
-                    lang,
-                    "WAV、FLAC、MP3、OGGに対応",
-                    "Supports WAV, FLAC, MP3, and OGG",
-                ))
-                .clicked();
-            reset_clicked = ui
-                .add_enabled(
-                    selected_path.is_some(),
-                    egui::Button::new(match kind {
-                        SoundKind::Subdivision if selected_builtin.is_none() => {
-                            tr(lang, "通常音に戻す", "Use normal")
-                        }
-                        SoundKind::Subdivision => tr(lang, "内蔵に戻す", "Use built-in"),
-                        SoundKind::Normal | SoundKind::Accent => {
-                            tr(lang, "内蔵に戻す", "Use built-in")
-                        }
-                    }),
-                )
-                .clicked();
-        });
+                ui.end_row();
+            });
 
         if builtin_changed {
             self.set_builtin_sound(kind, builtin);
@@ -1651,6 +2380,15 @@ impl MetronomeApp {
                 ),
             );
         }
+        if let Some(error) = &self.background_image_error {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!(
+                    "{}: {error}",
+                    tr(lang, "背景画像エラー", "Background image error")
+                ),
+            );
+        }
     }
 
     fn pulse_amount(&self, ctx: &egui::Context) -> f32 {
@@ -1689,16 +2427,17 @@ impl MetronomeApp {
         if self.last_primary_beat_time < 0.0 {
             return 0.5;
         }
-        let beat_unit = f64::from(self.config.time_signature.beat_unit.max(1));
-        let beat_interval_seconds =
-            60_000.0 / f64::from(self.config.bpm_milli.max(1)) * 4.0 / beat_unit;
-        let now = ctx.input(|input| input.time);
-        arc_motion_position(
-            self.is_running(),
-            self.arc_at_end,
-            (now - self.last_primary_beat_time).max(0.0),
-            beat_interval_seconds,
-        )
+        let elapsed = (ctx.input(|input| input.time) - self.last_primary_beat_time).max(0.0);
+        let progress = primary_beat_motion_progress(
+            elapsed,
+            self.config.bpm_milli,
+            self.config.time_signature.beat_unit,
+            self.config.time_signature.beats_per_bar,
+            self.last_primary_beat.map_or(0, |beat| beat.beat_index),
+            self.config.audio.swing.grid,
+            self.config.audio.swing.amount_percent,
+        );
+        arc_motion_position(self.is_running(), self.arc_at_end, f64::from(progress), 1.0)
     }
 
     fn arc_endpoint_pop_amount(&self, ctx: &egui::Context) -> f32 {
@@ -1768,7 +2507,27 @@ impl MetronomeApp {
             (MaterialIcon::Play, tr(self.language(), "再生", "Play"))
         };
         let rect = egui::Rect::from_center_size(center, egui::vec2(170.0, 54.0));
-        if material_icon_button_at(ui, rect, "playback_toggle", icon, tooltip).clicked() {
+        let audio_available = self.audio.is_some();
+        let response = ui
+            .scope(|ui| {
+                if !audio_available {
+                    ui.disable();
+                }
+                material_icon_button_at(ui, rect, "playback_toggle", icon, tooltip)
+            })
+            .inner;
+        let response = if audio_available {
+            response
+        } else {
+            response.on_disabled_hover_text(self.audio_error.as_deref().unwrap_or_else(|| {
+                tr(
+                    self.language(),
+                    "音声エンジンを利用できません",
+                    "Audio engine is unavailable",
+                )
+            }))
+        };
+        if response.clicked() {
             self.set_running(!running);
         }
     }
@@ -1904,15 +2663,14 @@ impl MetronomeApp {
             });
     }
 
-    fn show_arc_meter(
-        &mut self,
-        ui: &mut egui::Ui,
-        size: f32,
-        accent_pulse: f32,
-        subdivision_pulse: f32,
-        motion_ratio: f32,
-        endpoint_pop: f32,
-    ) {
+    fn show_arc_meter(&mut self, ui: &mut egui::Ui, size: f32, state: ArcMeterState) {
+        let ArcMeterState {
+            accent_pulse,
+            subdivision_pulse,
+            motion_ratio,
+            endpoint_pop,
+            compact,
+        } = state;
         let (rect, response) = centered_row(ui, size, size, |ui| {
             ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover())
         })
@@ -2013,17 +2771,22 @@ impl MetronomeApp {
             12.0 + marker_pop,
             egui::Stroke::new(2.0, visuals.extreme_bg_color),
         );
-        painter.text(
-            center + egui::vec2(0.0, -54.0),
-            egui::Align2::CENTER_CENTER,
-            "BPM",
-            egui::FontId::proportional(14.0),
-            visuals.weak_text_color(),
-        );
-        self.show_bpm_editor_in_meter(ui, center, plate_radius);
-        self.show_time_signature_editor_in_meter(ui, center);
-        self.show_meter_toolbar(ui, rect);
-        self.show_playback_button_at(ui, center + egui::vec2(0.0, base_radius * 0.92));
+        if compact {
+            paint_compact_bpm_label(&painter, center, plate_radius, &visuals);
+            self.show_compact_bpm_editor(ui, center, plate_radius);
+        } else {
+            painter.text(
+                center + egui::vec2(0.0, -54.0),
+                egui::Align2::CENTER_CENTER,
+                "BPM",
+                egui::FontId::proportional(14.0),
+                visuals.weak_text_color(),
+            );
+            self.show_bpm_editor_in_meter(ui, center, plate_radius);
+            self.show_time_signature_editor_in_meter(ui, center);
+            self.show_meter_toolbar(ui, rect);
+            self.show_playback_button_at(ui, center + egui::vec2(0.0, base_radius * 0.92));
+        }
     }
 
     fn show_circle_meter(
@@ -2033,6 +2796,7 @@ impl MetronomeApp {
         pulse: f32,
         accent_pulse: f32,
         subdivision_pulse: f32,
+        compact: bool,
     ) {
         let (rect, _) = centered_row(ui, size, size, |ui| {
             ui.allocate_exact_size(egui::Vec2::splat(size), egui::Sense::hover())
@@ -2109,17 +2873,66 @@ impl MetronomeApp {
             egui::Stroke::new(1.0, ui.visuals().widgets.inactive.bg_stroke.color),
         );
         paint_accent_ring(&painter, center, plate_radius, accent_pulse, accent_color);
-        painter.text(
-            center + egui::vec2(0.0, -54.0),
-            egui::Align2::CENTER_CENTER,
-            "BPM",
-            egui::FontId::proportional(14.0),
-            ui.visuals().weak_text_color(),
+        if compact {
+            paint_compact_bpm_label(&painter, center, plate_radius, ui.visuals());
+            self.show_compact_bpm_editor(ui, center, plate_radius);
+        } else {
+            painter.text(
+                center + egui::vec2(0.0, -54.0),
+                egui::Align2::CENTER_CENTER,
+                "BPM",
+                egui::FontId::proportional(14.0),
+                ui.visuals().weak_text_color(),
+            );
+            self.show_bpm_editor_in_meter(ui, center, plate_radius);
+            self.show_time_signature_editor_in_meter(ui, center);
+            self.show_meter_toolbar(ui, rect);
+            self.show_playback_button_at(ui, center + egui::vec2(0.0, radius + 64.0));
+        }
+    }
+
+    fn show_compact_bpm_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        center: egui::Pos2,
+        plate_radius: f32,
+    ) {
+        let mut bpm = self.config.bpm_milli / 1_000;
+        let scale = (plate_radius / 55.0).clamp(0.65, 1.0);
+        let editor_rect = egui::Rect::from_center_size(
+            center + egui::vec2(0.0, 8.0 * scale),
+            egui::vec2((plate_radius * 1.55).max(62.0), 40.0 * scale),
         );
-        self.show_bpm_editor_in_meter(ui, center, plate_radius);
-        self.show_time_signature_editor_in_meter(ui, center);
-        self.show_meter_toolbar(ui, rect);
-        self.show_playback_button_at(ui, center + egui::vec2(0.0, radius + 64.0));
+        let response = ui
+            .scope(|ui| {
+                ui.style_mut().text_styles.insert(
+                    egui::TextStyle::Heading,
+                    egui::FontId::proportional(34.0 * scale),
+                );
+                ui.style_mut().drag_value_text_style = egui::TextStyle::Heading;
+                ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
+                ui.style_mut().visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+                ui.style_mut().visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+                ui.spacing_mut().button_padding.y = 0.0;
+                ui.spacing_mut().interact_size.y = editor_rect.height();
+                ui.put(
+                    editor_rect,
+                    egui::DragValue::new(&mut bpm)
+                        .range((BPM_MIN / 1_000)..=(BPM_MAX / 1_000))
+                        .speed(f64::from(self.config.interaction.bpm_drag_sensitivity))
+                        .update_while_editing(false),
+                )
+            })
+            .inner;
+        let changed = response.changed();
+        response.on_hover_text(tr(
+            self.language(),
+            "ドラッグまたはクリック後に入力してBPMを変更",
+            "Drag or click, then type to change BPM",
+        ));
+        if changed {
+            self.set_bpm_milli(bpm * 1_000);
+        }
     }
 
     fn show_bpm_editor_in_meter(
@@ -2240,7 +3053,7 @@ impl MetronomeApp {
                 let denominator_response = ui.put(
                     denominator_rect,
                     egui::DragValue::new(&mut beat_unit)
-                        .range(2..=16)
+                        .range(BEAT_UNIT_MIN..=BEAT_UNIT_MAX)
                         .speed(f64::from(
                             self.config.interaction.time_signature_drag_sensitivity * 2.0,
                         ))
@@ -2271,8 +3084,8 @@ impl MetronomeApp {
         let denominator_changed = denominator_response.changed();
         denominator_response.on_hover_text(tr(
             self.language(),
-            "拍子の分母（2、4、8、16）",
-            "Time-signature denominator (2, 4, 8, or 16)",
+            "拍子の分母（1〜255、奇数も入力可）",
+            "Time-signature denominator (1–255, including odd values)",
         ));
         if denominator_changed {
             self.set_beat_unit(normalize_beat_unit(beat_unit));
@@ -2302,6 +3115,21 @@ fn paint_accent_ring(
         center,
         plate_radius + 4.0 + expansion,
         egui::Stroke::new(2.0 + pulse * 4.0, color),
+    );
+}
+
+fn paint_compact_bpm_label(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    plate_radius: f32,
+    visuals: &egui::Visuals,
+) {
+    painter.text(
+        center + egui::vec2(0.0, -plate_radius * 0.43),
+        egui::Align2::CENTER_CENTER,
+        "BPM",
+        egui::FontId::proportional((plate_radius * 0.24).clamp(11.0, 14.0)),
+        visuals.weak_text_color(),
     );
 }
 
@@ -2668,10 +3496,7 @@ fn paint_material_icon(
 }
 
 fn normalize_beat_unit(value: u8) -> u8 {
-    [2_u8, 4, 8, 16]
-        .into_iter()
-        .min_by_key(|candidate| candidate.abs_diff(value))
-        .unwrap_or(4)
+    value.clamp(BEAT_UNIT_MIN, BEAT_UNIT_MAX)
 }
 
 fn adjusted_percent(value: u8, delta: i16) -> u8 {
@@ -2963,6 +3788,62 @@ fn centered_row<R>(
     .inner
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CompactLayout {
+    meter_size: f32,
+    playback_size: egui::Vec2,
+    gap: f32,
+    top_padding: f32,
+    bottom_padding: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArcMeterState {
+    accent_pulse: f32,
+    subdivision_pulse: f32,
+    motion_ratio: f32,
+    endpoint_pop: f32,
+    compact: bool,
+}
+
+fn compact_layout(available: egui::Vec2) -> CompactLayout {
+    let available = egui::vec2(available.x.max(0.0), available.y.max(0.0));
+    let playback_size = egui::vec2(
+        COMPACT_PLAYBACK_SIZE.x.min(available.x),
+        COMPACT_PLAYBACK_SIZE.y.min(available.y),
+    );
+    let remaining_after_playback = (available.y - playback_size.y).max(0.0);
+    let bottom_padding = COMPACT_BOTTOM_PADDING.min(remaining_after_playback);
+    let gap = COMPACT_CONTENT_GAP.min((remaining_after_playback - bottom_padding).max(0.0));
+    let meter_size = available
+        .x
+        .min((available.y - playback_size.y - gap - bottom_padding).max(0.0));
+    let content_height = meter_size + gap + playback_size.y + bottom_padding;
+    CompactLayout {
+        meter_size,
+        playback_size,
+        gap,
+        top_padding: ((available.y - content_height) * 0.5).max(0.0),
+        bottom_padding,
+    }
+}
+
+fn is_compact_size(size: egui::Vec2) -> bool {
+    size.x < NORMAL_LAYOUT_MIN_SIZE.x || size.y < NORMAL_LAYOUT_MIN_SIZE.y
+}
+
+fn viewport_inner_size(ctx: &egui::Context) -> Option<egui::Vec2> {
+    ctx.input(|input| input.viewport().inner_rect.map(|rect| rect.size()))
+}
+
+fn apply_window_level(ctx: &egui::Context, always_on_top: bool) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if always_on_top {
+        egui::WindowLevel::AlwaysOnTop
+    } else {
+        egui::WindowLevel::Normal
+    }));
+}
+
 fn point_on_arc(center: egui::Pos2, radius: f32, angle: f32) -> egui::Pos2 {
     center + egui::vec2(angle.cos(), angle.sin()) * radius
 }
@@ -2996,6 +3877,139 @@ fn arc_motion_position(
     if at_end { 1.0 - progress } else { progress }
 }
 
+fn primary_beat_interval_seconds(
+    bpm_milli: u32,
+    beat_unit: u8,
+    beats_per_bar: u8,
+    beat_index: u8,
+    swing_grid: SwingGrid,
+    swing_amount_percent: i16,
+) -> f64 {
+    let beat_unit = beat_unit.clamp(BEAT_UNIT_MIN, BEAT_UNIT_MAX);
+    let beats_per_bar = beats_per_bar.clamp(1, 16);
+    let beat_index = beat_index.min(beats_per_bar - 1);
+    let nominal_seconds = 60_000.0 / f64::from(bpm_milli.max(1)) * 4.0 / f64::from(beat_unit);
+    let current = swung_beat_position(
+        f64::from(beat_index),
+        beats_per_bar,
+        beat_unit,
+        swing_grid,
+        swing_amount_percent,
+    );
+    let next_straight = u16::from(beat_index) + 1;
+    let next = if next_straight >= u16::from(beats_per_bar) {
+        f64::from(beats_per_bar)
+    } else {
+        swung_beat_position(
+            f64::from(next_straight),
+            beats_per_bar,
+            beat_unit,
+            swing_grid,
+            swing_amount_percent,
+        )
+    };
+    nominal_seconds * (next - current).max(f64::EPSILON)
+}
+
+fn primary_beat_motion_progress(
+    elapsed_seconds: f64,
+    bpm_milli: u32,
+    beat_unit: u8,
+    beats_per_bar: u8,
+    beat_index: u8,
+    swing_grid: SwingGrid,
+    swing_amount_percent: i16,
+) -> f32 {
+    let beat_unit = beat_unit.clamp(BEAT_UNIT_MIN, BEAT_UNIT_MAX);
+    let beats_per_bar = beats_per_bar.clamp(1, 16);
+    let beat_index = beat_index.min(beats_per_bar - 1);
+    let current_straight = f64::from(beat_index);
+    let next_straight = current_straight + 1.0;
+    let current_swung = swung_beat_position(
+        current_straight,
+        beats_per_bar,
+        beat_unit,
+        swing_grid,
+        swing_amount_percent,
+    );
+    let next_swung = if next_straight >= f64::from(beats_per_bar) {
+        f64::from(beats_per_bar)
+    } else {
+        swung_beat_position(
+            next_straight,
+            beats_per_bar,
+            beat_unit,
+            swing_grid,
+            swing_amount_percent,
+        )
+    };
+    let beat_interval_seconds = primary_beat_interval_seconds(
+        bpm_milli,
+        beat_unit,
+        beats_per_bar,
+        beat_index,
+        swing_grid,
+        swing_amount_percent,
+    );
+    let interval_progress = (elapsed_seconds.max(0.0) / beat_interval_seconds).clamp(0.0, 1.0);
+    let target_swung = current_swung + (next_swung - current_swung) * interval_progress;
+
+    // Invert the scheduler's monotonic piecewise-linear warp. This keeps the
+    // moving marker aligned with swung subdivision guides, not only with the
+    // primary-beat endpoints.
+    let mut low = current_straight;
+    let mut high = next_straight;
+    for _ in 0..32 {
+        let middle = (low + high) * 0.5;
+        let middle_swung = swung_beat_position(
+            middle,
+            beats_per_bar,
+            beat_unit,
+            swing_grid,
+            swing_amount_percent,
+        );
+        if middle_swung < target_swung {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    (((low + high) * 0.5 - current_straight).clamp(0.0, 1.0)) as f32
+}
+
+fn swung_beat_position(
+    straight: f64,
+    beats_per_bar: u8,
+    beat_unit: u8,
+    swing_grid: SwingGrid,
+    swing_amount_percent: i16,
+) -> f64 {
+    let amount = f64::from(swing_amount_percent.clamp(SWING_AMOUNT_MIN, SWING_AMOUNT_MAX));
+    if amount == 0.0 {
+        return straight;
+    }
+    let denominator = match swing_grid {
+        SwingGrid::Quarter => 4.0,
+        SwingGrid::Eighth => 8.0,
+        SwingGrid::Sixteenth => 16.0,
+    };
+    let grid = f64::from(beat_unit) / denominator;
+    let pair_length = grid * 2.0;
+    let pair_start = (straight / pair_length).floor() * pair_length;
+    if pair_start + pair_length > f64::from(beats_per_bar) + f64::EPSILON {
+        return straight;
+    }
+    let local = straight - pair_start;
+    let first_weight = (100.0 + amount) / 100.0;
+    let second_weight = (100.0 - amount) / 100.0;
+    let warped_local = if local <= grid {
+        local * first_weight
+    } else {
+        grid * first_weight + (local - grid) * second_weight
+    };
+    pair_start + warped_local
+}
+
 fn arc_endpoint_pop(elapsed_seconds: f64) -> f32 {
     const POP_DURATION_SECONDS: f64 = 0.14;
     let progress = (elapsed_seconds / POP_DURATION_SECONDS).clamp(0.0, 1.0) as f32;
@@ -3010,6 +4024,8 @@ fn subdivision_guide_emphasis(elapsed_seconds: f64) -> f32 {
 
 impl eframe::App for MetronomeApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.clear_inactive_sound_drop_target(ctx);
+        self.poll_background_image_tasks(ctx);
         self.poll_audio_events(ctx);
         self.poll_menu_events(ctx);
         self.poll_platform_events(ctx);
@@ -3018,12 +4034,21 @@ impl eframe::App for MetronomeApp {
         if self.config.background.close_behavior.keeps_running() {
             ctx.request_repaint_after(Duration::from_millis(80));
         }
+        if self.pending_background_load.is_some() || self.pending_background_blur.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
     }
 
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root.ctx().clone();
         self.handle_shortcuts(&ctx);
+        let compact = viewport_inner_size(&ctx).is_some_and(is_compact_size);
         egui::CentralPanel::default().show(root, |ui| {
+            self.paint_background_image(ui, !compact && self.tab == AppTab::Preferences);
+            if compact {
+                self.show_compact_content(ui, &ctx);
+                return;
+            }
             if self.native_menu.is_none() {
                 self.show_menu(ui, &ctx);
                 ui.separator();
@@ -3050,11 +4075,156 @@ impl eframe::App for MetronomeApp {
                 self.show_main_content(ui, &ctx);
             }
         });
-        self.show_auxiliary_windows(&ctx);
+        if !compact {
+            self.show_auxiliary_windows(&ctx);
+        }
 
         if self.is_running() {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
+    }
+}
+
+fn prepare_background_image(
+    path: &Path,
+    normal_blur_percent: u8,
+    sender: &mpsc::Sender<BackgroundLoadMessage>,
+) -> Result<PreparedBackgroundImage, String> {
+    let _ = sender.send(BackgroundLoadMessage::Stage(BackgroundLoadStage::Opening));
+    let file =
+        File::open(path).map_err(|error| format!("画像ファイルを開けませんでした: {error}"))?;
+    let mut reader = image::ImageReader::new(BufReader::new(file))
+        .with_guessed_format()
+        .map_err(|error| format!("画像形式を判定できませんでした: {error}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(BACKGROUND_IMAGE_MAX_DECODE_DIMENSION);
+    limits.max_image_height = Some(BACKGROUND_IMAGE_MAX_DECODE_DIMENSION);
+    limits.max_alloc = Some(BACKGROUND_IMAGE_MAX_DECODE_BYTES);
+    reader.limits(limits);
+    let _ = sender.send(BackgroundLoadMessage::Stage(BackgroundLoadStage::Decoding));
+    let decoded = reader
+        .decode()
+        .map_err(|error| format!("画像を読み込めませんでした: {error}"))?;
+    if decoded.width() == 0 || decoded.height() == 0 {
+        return Err("画像のサイズが0です".to_owned());
+    }
+    let _ = sender.send(BackgroundLoadMessage::Stage(BackgroundLoadStage::Resizing));
+    let decoded = if decoded.width() > BACKGROUND_IMAGE_MAX_TEXTURE_DIMENSION
+        || decoded.height() > BACKGROUND_IMAGE_MAX_TEXTURE_DIMENSION
+    {
+        decoded.resize(
+            BACKGROUND_IMAGE_MAX_TEXTURE_DIMENSION,
+            BACKGROUND_IMAGE_MAX_TEXTURE_DIMENSION,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        decoded
+    };
+    let regular_rgba = decoded.to_rgba8();
+    let blur_source = if regular_rgba.width() > BACKGROUND_IMAGE_BLUR_TEXTURE_MAX_DIMENSION
+        || regular_rgba.height() > BACKGROUND_IMAGE_BLUR_TEXTURE_MAX_DIMENSION
+    {
+        image::imageops::thumbnail(
+            &regular_rgba,
+            BACKGROUND_IMAGE_BLUR_TEXTURE_MAX_DIMENSION,
+            BACKGROUND_IMAGE_BLUR_TEXTURE_MAX_DIMENSION,
+        )
+    } else {
+        regular_rgba.clone()
+    };
+    let _ = sender.send(BackgroundLoadMessage::Stage(BackgroundLoadStage::Blurring));
+    let preferences_blurred_rgba =
+        image::imageops::blur(&blur_source, PREFERENCES_BACKGROUND_BLUR_SIGMA);
+    let normal_blurred = (normal_blur_percent > 0).then(|| {
+        let blurred = image::imageops::blur(
+            &blur_source,
+            normal_background_blur_sigma(normal_blur_percent),
+        );
+        rgba_to_color_image(&blurred)
+    });
+    let size = egui::vec2(regular_rgba.width() as f32, regular_rgba.height() as f32);
+    Ok(PreparedBackgroundImage {
+        regular: rgba_to_color_image(&regular_rgba),
+        normal_blurred,
+        preferences_blurred: rgba_to_color_image(&preferences_blurred_rgba),
+        blur_source,
+        size,
+    })
+}
+
+fn upload_background_image(
+    ctx: &egui::Context,
+    prepared: PreparedBackgroundImage,
+) -> BackgroundImage {
+    let regular = ctx.load_texture(
+        "background_image",
+        prepared.regular,
+        egui::TextureOptions::LINEAR,
+    );
+    let normal_blurred = prepared.normal_blurred.map(|image| {
+        ctx.load_texture(
+            "background_image_normal_blurred",
+            image,
+            egui::TextureOptions::LINEAR,
+        )
+    });
+    let preferences_blurred = ctx.load_texture(
+        "background_image_preferences_blurred",
+        prepared.preferences_blurred,
+        egui::TextureOptions::LINEAR,
+    );
+    BackgroundImage {
+        regular,
+        normal_blurred,
+        preferences_blurred,
+        blur_source: prepared.blur_source,
+        size: prepared.size,
+    }
+}
+
+fn rgba_to_color_image(image: &image::RgbaImage) -> egui::ColorImage {
+    let size = [image.width() as usize, image.height() as usize];
+    egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw())
+}
+
+fn normal_background_blur_sigma(percent: u8) -> f32 {
+    f32::from(percent.min(100)) * NORMAL_BACKGROUND_BLUR_MAX_SIGMA / 100.0
+}
+
+fn background_opacity_alpha(percent: u8) -> u8 {
+    ((u16::from(percent.min(100)) * 255 + 50) / 100) as u8
+}
+
+fn background_load_stage_label(lang: Language, stage: BackgroundLoadStage) -> &'static str {
+    match stage {
+        BackgroundLoadStage::Opening => {
+            tr(lang, "画像ファイルを開いています…", "Opening the image…")
+        }
+        BackgroundLoadStage::Decoding => tr(lang, "画像を読み込んでいます…", "Decoding the image…"),
+        BackgroundLoadStage::Resizing => tr(
+            lang,
+            "表示用サイズへ変換しています…",
+            "Optimizing the image for display…",
+        ),
+        BackgroundLoadStage::Blurring => tr(
+            lang,
+            "ぼかし画像を準備しています…",
+            "Preparing blurred variants…",
+        ),
+    }
+}
+
+fn cover_uv(image_size: egui::Vec2, target_size: egui::Vec2) -> egui::Rect {
+    let image_aspect = image_size.x / image_size.y.max(f32::EPSILON);
+    let target_aspect = target_size.x / target_size.y.max(f32::EPSILON);
+    if image_aspect > target_aspect {
+        let visible_width = target_aspect / image_aspect;
+        let left = (1.0 - visible_width) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(left, 0.0), egui::pos2(1.0 - left, 1.0))
+    } else {
+        let visible_height = image_aspect / target_aspect.max(f32::EPSILON);
+        let top = (1.0 - visible_height) * 0.5;
+        egui::Rect::from_min_max(egui::pos2(0.0, top), egui::pos2(1.0, 1.0 - top))
     }
 }
 
@@ -3098,6 +4268,27 @@ fn builtin_sound_label(sound: BuiltinSound) -> &'static str {
     }
 }
 
+fn sound_kind_label(lang: Language, kind: SoundKind) -> &'static str {
+    match kind {
+        SoundKind::Normal => tr(lang, "通常音", "Normal"),
+        SoundKind::Accent => tr(lang, "アクセント", "Accent"),
+        SoundKind::Subdivision => "Subdivision",
+    }
+}
+
+fn sound_drop_matches(
+    kind: SoundKind,
+    tracked_target: Option<SoundKind>,
+    pointer_inside: bool,
+    pointer_position_known: bool,
+) -> bool {
+    if pointer_position_known {
+        pointer_inside
+    } else {
+        tracked_target == Some(kind)
+    }
+}
+
 fn meter_mode_label(lang: Language, mode: MeterMode) -> &'static str {
     match mode {
         MeterMode::Arc => tr(lang, "円弧", "Arc"),
@@ -3110,6 +4301,14 @@ fn subdivision_label(lang: Language, subdivision: u8) -> String {
         tr(lang, "オフ", "Off").to_owned()
     } else {
         format!("×{}", subdivision.clamp(2, 8))
+    }
+}
+
+fn swing_grid_label(grid: SwingGrid) -> &'static str {
+    match grid {
+        SwingGrid::Quarter => "1/4",
+        SwingGrid::Eighth => "1/8",
+        SwingGrid::Sixteenth => "1/16",
     }
 }
 
@@ -3163,10 +4362,39 @@ mod tests {
     use eframe::egui;
 
     use super::{
-        ARC_SWEEP_ANGLE, arc_endpoint_pop, arc_motion_position, format_shortcut, is_modifier_key,
-        normalize_beat_unit, subdivision_guide_emphasis, unique_preset_name,
+        ARC_SWEEP_ANGLE, NORMAL_LAYOUT_MIN_SIZE, SoundKind, arc_endpoint_pop, arc_motion_position,
+        background_opacity_alpha, compact_layout, cover_uv, format_shortcut, is_compact_size,
+        is_modifier_key, normal_background_blur_sigma, normalize_beat_unit,
+        prepare_background_image, primary_beat_interval_seconds, primary_beat_motion_progress,
+        sound_drop_matches, subdivision_guide_emphasis, unique_preset_name,
     };
-    use crate::config::BpmPreset;
+    use crate::config::{BpmPreset, SwingGrid};
+
+    #[test]
+    fn compact_mode_starts_below_either_normal_layout_dimension() {
+        assert!(!is_compact_size(NORMAL_LAYOUT_MIN_SIZE));
+        assert!(is_compact_size(egui::vec2(419.0, 560.0)));
+        assert!(is_compact_size(egui::vec2(420.0, 559.0)));
+        assert!(is_compact_size(egui::vec2(240.0, 300.0)));
+    }
+
+    #[test]
+    fn compact_geometry_fits_minimum_viewport_content_without_overlap() {
+        // CentralPanel's default 8-point margin on every side leaves this much usable space
+        // in the 240 x 300 logical-pixel minimum window.
+        let available = egui::vec2(224.0, 284.0);
+        let layout = compact_layout(available);
+        let meter_bottom = layout.top_padding + layout.meter_size;
+        let playback_top = meter_bottom + layout.gap;
+        let playback_bottom = playback_top + layout.playback_size.y;
+
+        assert_eq!(layout.meter_size, 212.0);
+        assert!(meter_bottom <= playback_top);
+        assert!(layout.bottom_padding >= 12.0);
+        assert!(playback_bottom < available.y);
+        assert!(playback_bottom + layout.bottom_padding <= available.y);
+        assert!(layout.playback_size.x <= available.x);
+    }
 
     #[test]
     fn arc_motion_moves_linearly_and_centers_when_stopped() {
@@ -3186,6 +4414,25 @@ mod tests {
     }
 
     #[test]
+    fn arc_motion_duration_follows_quarter_note_swing() {
+        let long = primary_beat_interval_seconds(120_000, 4, 4, 0, SwingGrid::Quarter, 100);
+        let short = primary_beat_interval_seconds(120_000, 4, 4, 1, SwingGrid::Quarter, 100);
+        assert!((long - 1.0).abs() < 0.0001);
+        assert!(short <= f64::EPSILON * 2.0);
+
+        let straight = primary_beat_interval_seconds(120_000, 4, 3, 2, SwingGrid::Quarter, 100);
+        assert!((straight - 0.5).abs() < 0.0001);
+    }
+
+    #[test]
+    fn arc_marker_crosses_subdivision_guides_on_the_swung_event() {
+        let offbeat_time = 0.5;
+        let progress =
+            primary_beat_motion_progress(offbeat_time, 120_000, 4, 4, 0, SwingGrid::Eighth, 100);
+        assert!((progress - 0.5).abs() < 0.0001);
+    }
+
+    #[test]
     fn arc_marker_pop_is_brief_and_decays_from_the_endpoint() {
         assert!((arc_endpoint_pop(0.0) - 1.0).abs() < 0.0001);
         assert!((arc_endpoint_pop(0.07) - 0.25).abs() < 0.0001);
@@ -3202,11 +4449,95 @@ mod tests {
     }
 
     #[test]
-    fn beat_unit_is_normalized_to_supported_values() {
+    fn beat_unit_accepts_arbitrary_positive_values() {
+        assert_eq!(normalize_beat_unit(0), 1);
         assert_eq!(normalize_beat_unit(2), 2);
-        assert_eq!(normalize_beat_unit(5), 4);
-        assert_eq!(normalize_beat_unit(7), 8);
-        assert_eq!(normalize_beat_unit(15), 16);
+        assert_eq!(normalize_beat_unit(3), 3);
+        assert_eq!(normalize_beat_unit(5), 5);
+        assert_eq!(normalize_beat_unit(7), 7);
+        assert_eq!(normalize_beat_unit(255), 255);
+    }
+
+    #[test]
+    fn background_cover_uv_crops_from_the_center() {
+        let wide = cover_uv(egui::vec2(200.0, 100.0), egui::vec2(100.0, 100.0));
+        assert_eq!(wide.min, egui::pos2(0.25, 0.0));
+        assert_eq!(wide.max, egui::pos2(0.75, 1.0));
+
+        let tall = cover_uv(egui::vec2(100.0, 200.0), egui::vec2(100.0, 100.0));
+        assert_eq!(tall.min, egui::pos2(0.0, 0.25));
+        assert_eq!(tall.max, egui::pos2(1.0, 0.75));
+
+        let matching = cover_uv(egui::vec2(160.0, 90.0), egui::vec2(320.0, 180.0));
+        assert_eq!(
+            matching,
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
+        );
+    }
+
+    #[test]
+    fn bundled_png_can_be_prepared_as_background_textures() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets")
+            .join("metronome-rs.png");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let background =
+            prepare_background_image(&path, 0, &sender).expect("background should load");
+        assert!(background.size.x > 0.0);
+        assert!(background.size.y > 0.0);
+        assert!(background.normal_blurred.is_none());
+        assert!(background.regular.width() <= 2_048);
+        assert!(background.regular.height() <= 2_048);
+        assert!(background.blur_source.width() <= 768);
+        assert!(background.blur_source.height() <= 768);
+        let stages: Vec<_> = receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                super::BackgroundLoadMessage::Stage(stage) => Some(stage),
+                super::BackgroundLoadMessage::Finished(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            stages,
+            vec![
+                super::BackgroundLoadStage::Opening,
+                super::BackgroundLoadStage::Decoding,
+                super::BackgroundLoadStage::Resizing,
+                super::BackgroundLoadStage::Blurring,
+            ]
+        );
+    }
+
+    #[test]
+    fn background_display_percentages_map_to_render_values() {
+        assert_eq!(background_opacity_alpha(0), 0);
+        assert_eq!(background_opacity_alpha(50), 128);
+        assert_eq!(background_opacity_alpha(100), 255);
+        assert_eq!(normal_background_blur_sigma(0), 0.0);
+        assert_eq!(normal_background_blur_sigma(50), 12.0);
+        assert_eq!(normal_background_blur_sigma(100), 24.0);
+    }
+
+    #[test]
+    fn sound_drop_prefers_the_current_pointer_position() {
+        assert!(sound_drop_matches(
+            SoundKind::Accent,
+            Some(SoundKind::Normal),
+            true,
+            true,
+        ));
+        assert!(!sound_drop_matches(
+            SoundKind::Normal,
+            Some(SoundKind::Normal),
+            false,
+            true,
+        ));
+        assert!(sound_drop_matches(
+            SoundKind::Normal,
+            Some(SoundKind::Normal),
+            false,
+            false,
+        ));
     }
 
     #[test]
