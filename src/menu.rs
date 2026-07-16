@@ -43,6 +43,8 @@ pub struct NativeMenu {
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     localized_items: Vec<(muda::MenuItem, &'static str, &'static str)>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
+    localized_check_items: Vec<(muda::CheckMenuItem, &'static str, &'static str)>,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
     localized_submenus: Vec<(muda::Submenu, &'static str, &'static str)>,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     toggle_playback: muda::MenuItem,
@@ -486,19 +488,38 @@ mod native {
                 (show_presets, "プリセットを管理…", "Manage presets…"),
                 (show_metronome, "メトロノーム", "Metronome"),
                 (show_preferences, "環境設定", "Preferences"),
-                (meter_arc, "円弧モード", "Arc mode"),
-                (meter_beat_ring, "円形モード", "Beat-ring mode"),
-                (theme_system, "テーマ: システム設定", "Theme: System"),
-                (theme_dark, "テーマ: ダーク", "Theme: Dark"),
-                (theme_light, "テーマ: ライト", "Theme: Light"),
-                (language_system, "言語: システム設定", "Language: System"),
-                (language_japanese, "言語: 日本語", "Language: Japanese"),
-                (language_english, "言語: English", "Language: English"),
                 (about, "metronome-rsについて…", "About metronome-rs…"),
                 (
                     shortcut_settings,
                     "ショートカット設定…",
                     "Shortcut settings…",
+                ),
+            ];
+            let localized_check_items = vec![
+                (always_on_top.clone(), "常に最前面", "Always on top"),
+                (meter_arc.clone(), "円弧モード", "Arc mode"),
+                (meter_beat_ring.clone(), "円形モード", "Beat-ring mode"),
+                (
+                    theme_system.clone(),
+                    "テーマ: システム設定",
+                    "Theme: System",
+                ),
+                (theme_dark.clone(), "テーマ: ダーク", "Theme: Dark"),
+                (theme_light.clone(), "テーマ: ライト", "Theme: Light"),
+                (
+                    language_system.clone(),
+                    "言語: システム設定",
+                    "Language: System",
+                ),
+                (
+                    language_japanese.clone(),
+                    "言語: 日本語",
+                    "Language: Japanese",
+                ),
+                (
+                    language_english.clone(),
+                    "言語: English",
+                    "Language: English",
                 ),
             ];
             #[cfg(target_os = "windows")]
@@ -525,6 +546,7 @@ mod native {
             Ok(Self {
                 _menu: menu,
                 localized_items,
+                localized_check_items,
                 localized_submenus,
                 toggle_playback,
                 bpm_up,
@@ -582,6 +604,9 @@ mod native {
             background: &BackgroundConfig,
         ) {
             for (item, japanese, english) in &self.localized_items {
+                item.set_text(label(language, japanese, english));
+            }
+            for (item, japanese, english) in &self.localized_check_items {
                 item.set_text(label(language, japanese, english));
             }
             for (submenu, japanese, english) in &self.localized_submenus {
