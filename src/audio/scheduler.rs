@@ -1,8 +1,54 @@
-use std::collections::VecDeque;
+use crate::config::{BEAT_UNIT_MAX, BEAT_UNIT_MIN, BPM_MAX, BPM_MIN};
 
-use crate::config::{BPM_MAX, BPM_MIN, CLICK_OFFSET_MAX_MS, CLICK_OFFSET_MIN_MS};
+// This is divisible by every supported subdivision count (1..=8) and by the
+// swing interpolation denominator (100). Keeping bar positions in this fixed
+// point scale lets odd subdivisions be warped without floating-point drift.
+const POSITION_SCALE: u64 = 252_000;
 
-const MAX_DELAYED_EVENTS: usize = 128;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwingGrid {
+    Quarter,
+    Eighth,
+    Sixteenth,
+}
+
+impl SwingGrid {
+    const fn denominator(self) -> u64 {
+        match self {
+            Self::Quarter => 4,
+            Self::Eighth => 8,
+            Self::Sixteenth => 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwingSettings {
+    pub grid: SwingGrid,
+    pub amount_percent: i16,
+}
+
+impl SwingSettings {
+    pub const fn new(grid: SwingGrid, amount_percent: i16) -> Self {
+        Self {
+            grid,
+            amount_percent,
+        }
+    }
+
+    fn normalized(self) -> Self {
+        Self {
+            grid: self.grid,
+            amount_percent: self.amount_percent.clamp(-100, 100),
+        }
+    }
+}
+
+impl Default for SwingSettings {
+    fn default() -> Self {
+        Self::new(SwingGrid::Eighth, 0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BeatEvent {
@@ -13,268 +59,217 @@ pub struct BeatEvent {
     pub is_accent: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pattern {
+    beats_per_bar: u8,
+    beat_unit: u8,
+    subdivisions_per_beat: u8,
+    swing: SwingSettings,
+}
+
+impl Pattern {
+    fn new(
+        beats_per_bar: u8,
+        beat_unit: u8,
+        subdivisions_per_beat: u8,
+        swing: SwingSettings,
+    ) -> Self {
+        Self {
+            beats_per_bar: beats_per_bar.clamp(1, 16),
+            beat_unit: beat_unit.clamp(BEAT_UNIT_MIN, BEAT_UNIT_MAX),
+            subdivisions_per_beat: subdivisions_per_beat.clamp(1, 8),
+            swing: swing.normalized(),
+        }
+    }
+
+    fn events_per_bar(self) -> u16 {
+        u16::from(self.beats_per_bar) * u16::from(self.subdivisions_per_beat)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BeatScheduler {
-    threshold: u64,
-    phase_increment: u64,
-    phase: u64,
-    beat_index: u8,
-    subdivision_index: u8,
+    // A notated beat occupies `beat_threshold_scaled` phase units. Phase is
+    // advanced once per audio sample, so BeatEvents are emitted directly on
+    // their rhythmic sample frame and can be offset later by the audio layer.
+    beat_threshold_scaled: u64,
+    bar_phase_scaled: u64,
+    next_event_ordinal: u16,
     running: bool,
-    force_first_click: bool,
-    pending_current_click: bool,
-    early_next_click_fired: bool,
-    frame_index: u64,
-    delayed_events: VecDeque<(u64, BeatEvent)>,
-    active_offset_ms: i32,
+    active_pattern: Option<Pattern>,
 }
 
 impl BeatScheduler {
     pub fn new(sample_rate_hz: u32) -> Self {
         Self {
-            threshold: u64::from(sample_rate_hz) * 60_000,
-            phase_increment: 120_000,
-            phase: 0,
-            beat_index: 0,
-            subdivision_index: 0,
+            beat_threshold_scaled: u64::from(sample_rate_hz)
+                .saturating_mul(60_000)
+                .saturating_mul(4)
+                .saturating_mul(POSITION_SCALE),
+            bar_phase_scaled: 0,
+            next_event_ordinal: 0,
             running: false,
-            force_first_click: false,
-            pending_current_click: false,
-            early_next_click_fired: false,
-            frame_index: 0,
-            delayed_events: VecDeque::with_capacity(MAX_DELAYED_EVENTS),
-            active_offset_ms: 0,
+            active_pattern: None,
         }
     }
 
-    pub fn set_tempo(&mut self, bpm_milli: u32, beat_unit: u8) {
-        let bpm_milli = bpm_milli.clamp(BPM_MIN, BPM_MAX);
-        let beat_unit = match beat_unit {
-            2 | 4 | 8 | 16 => beat_unit,
-            _ => 4,
-        };
-        self.phase_increment = u64::from(bpm_milli) * u64::from(beat_unit) / 4;
-    }
-
     pub fn start(&mut self) {
-        self.phase = 0;
-        self.beat_index = 0;
-        self.subdivision_index = 0;
+        self.bar_phase_scaled = 0;
+        self.next_event_ordinal = 0;
         self.running = true;
-        self.force_first_click = true;
-        self.pending_current_click = false;
-        self.early_next_click_fired = false;
-        self.frame_index = 0;
-        self.delayed_events.clear();
-        self.active_offset_ms = 0;
+        self.active_pattern = None;
     }
 
     pub fn stop(&mut self) {
         self.running = false;
-        self.force_first_click = false;
-        self.pending_current_click = false;
-        self.early_next_click_fired = false;
-        self.delayed_events.clear();
-        self.active_offset_ms = 0;
+        self.bar_phase_scaled = 0;
+        self.next_event_ordinal = 0;
+        self.active_pattern = None;
     }
 
+    /// Advances the rhythmic clock by one audio sample frame.
+    ///
+    /// Every emitted event is already placed on the swung rhythmic grid. At
+    /// ±100%, multiple events can intentionally share one sample frame, so a
+    /// callback is used instead of returning a single event. Sound-source
+    /// offsets should be applied after this scheduler so they never alter the
+    /// BeatEvent used for visual feedback.
     pub fn advance_frame(
         &mut self,
         bpm_milli: u32,
         beats_per_bar: u8,
         beat_unit: u8,
         subdivisions_per_beat: u8,
-        click_offset_ms: i32,
-    ) -> Option<BeatEvent> {
-        self.set_tempo(bpm_milli, beat_unit);
+        swing: SwingSettings,
+        mut emit: impl FnMut(BeatEvent),
+    ) {
         if !self.running {
-            return None;
+            return;
         }
 
-        let beats_per_bar = beats_per_bar.clamp(1, 16);
-        let subdivisions_per_beat = subdivisions_per_beat.clamp(1, 8);
-        let subdivision_threshold = self.threshold / u64::from(subdivisions_per_beat);
-        self.phase %= subdivision_threshold;
-        self.subdivision_index %= subdivisions_per_beat;
-        let click_offset_ms = click_offset_ms.clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS);
-        if self.active_offset_ms != click_offset_ms {
-            self.delayed_events.clear();
-            self.pending_current_click = false;
-            self.early_next_click_fired = false;
-            self.active_offset_ms = click_offset_ms;
+        // Complete a pending bar with its previous pattern first. A +100%
+        // offbeat can land exactly on the next bar line and must be emitted on
+        // the same sample frame as the new downbeat instead of being dropped.
+        if let Some(previous) = self.active_pattern {
+            self.wrap_completed_bars(previous, &mut emit);
         }
 
-        let event = if click_offset_ms > 0 {
-            if let Some(event) = self.advance_offset_core(
-                beats_per_bar,
-                subdivisions_per_beat,
-                subdivision_threshold,
-                0,
-            ) {
-                let due_frame = self
-                    .frame_index
-                    .saturating_add(self.offset_frames(click_offset_ms));
-                if self.delayed_events.len() == MAX_DELAYED_EVENTS {
-                    self.delayed_events.pop_front();
-                }
-                self.delayed_events.push_back((due_frame, event));
-            }
-            if self
-                .delayed_events
-                .front()
-                .is_some_and(|(due_frame, _)| *due_frame <= self.frame_index)
-            {
-                self.delayed_events.pop_front().map(|(_, event)| event)
-            } else {
-                None
-            }
-        } else {
-            self.advance_offset_core(
-                beats_per_bar,
-                subdivisions_per_beat,
-                subdivision_threshold,
-                click_offset_ms,
-            )
-        };
-        self.frame_index = self.frame_index.saturating_add(1);
-        event
+        let pattern = Pattern::new(beats_per_bar, beat_unit, subdivisions_per_beat, swing);
+        self.apply_pattern_change(pattern);
+        self.wrap_completed_bars(pattern, &mut emit);
+        self.emit_due_events(pattern, self.bar_phase_scaled, &mut emit);
+
+        let bpm_milli = bpm_milli.clamp(BPM_MIN, BPM_MAX);
+        let phase_increment = u64::from(bpm_milli)
+            .saturating_mul(u64::from(pattern.beat_unit))
+            .saturating_mul(POSITION_SCALE);
+        self.bar_phase_scaled = self.bar_phase_scaled.saturating_add(phase_increment);
     }
 
-    fn advance_offset_core(
+    fn wrap_completed_bars(&mut self, pattern: Pattern, emit: &mut impl FnMut(BeatEvent)) {
+        let bar_length = self.bar_length_scaled(pattern);
+        while self.bar_phase_scaled >= bar_length {
+            self.emit_due_events(pattern, bar_length, emit);
+            self.bar_phase_scaled -= bar_length;
+            self.next_event_ordinal = 0;
+        }
+    }
+
+    fn emit_due_events(
         &mut self,
-        beats_per_bar: u8,
-        subdivisions_per_beat: u8,
-        subdivision_threshold: u64,
-        click_offset_ms: i32,
-    ) -> Option<BeatEvent> {
-        let mut event = None;
-
-        if self.force_first_click {
-            self.force_first_click = false;
-            if click_offset_ms <= 0 {
-                event = Some(self.event_for(
-                    self.beat_index,
-                    self.subdivision_index,
-                    beats_per_bar,
-                    subdivisions_per_beat,
-                ));
-            } else {
-                self.pending_current_click = true;
-            }
+        pattern: Pattern,
+        through_phase: u64,
+        emit: &mut impl FnMut(BeatEvent),
+    ) {
+        while self.next_event_ordinal < pattern.events_per_bar()
+            && self.event_phase_scaled(pattern, self.next_event_ordinal) <= through_phase
+        {
+            let event = self.event_for(pattern, self.next_event_ordinal);
+            self.next_event_ordinal += 1;
+            emit(event);
         }
-
-        if event.is_none() {
-            if click_offset_ms >= 0 {
-                let target_phase = self
-                    .offset_phase(click_offset_ms)
-                    .min(subdivision_threshold.saturating_sub(1));
-                // The requested offset can be as long as (or longer than) the
-                // current click interval. In that case `target_phase` is
-                // clamped just before the boundary and may not be exactly
-                // reachable by the phase increment. Fire on the frame that
-                // crosses the target instead of waiting forever.
-                let next_phase = self.phase.saturating_add(self.phase_increment);
-                if self.pending_current_click
-                    && (self.phase >= target_phase || next_phase >= target_phase)
-                {
-                    self.pending_current_click = false;
-                    event = Some(self.event_for(
-                        self.beat_index,
-                        self.subdivision_index,
-                        beats_per_bar,
-                        subdivisions_per_beat,
-                    ));
-                }
-            } else {
-                let offset_phase = self.offset_phase(click_offset_ms.abs());
-                let whole_intervals = offset_phase / subdivision_threshold;
-                let remaining_phase = offset_phase % subdivision_threshold;
-                let early_phase = if remaining_phase == 0 {
-                    subdivision_threshold.saturating_sub(1)
-                } else {
-                    subdivision_threshold - remaining_phase
-                };
-                let next_phase = self.phase.saturating_add(self.phase_increment);
-                if !self.early_next_click_fired
-                    && (self.phase >= early_phase || next_phase >= early_phase)
-                {
-                    self.early_next_click_fired = true;
-                    let (beat_index, subdivision_index) = self.future_position(
-                        beats_per_bar,
-                        subdivisions_per_beat,
-                        whole_intervals.saturating_add(1),
-                    );
-                    event = Some(self.event_for(
-                        beat_index,
-                        subdivision_index,
-                        beats_per_bar,
-                        subdivisions_per_beat,
-                    ));
-                }
-            }
-        }
-
-        self.phase += self.phase_increment;
-        if self.phase >= subdivision_threshold {
-            self.phase -= subdivision_threshold;
-            (self.beat_index, self.subdivision_index) =
-                self.next_position(beats_per_bar, subdivisions_per_beat);
-            if click_offset_ms >= 0 {
-                self.pending_current_click = true;
-            } else {
-                self.early_next_click_fired = false;
-            }
-        }
-
-        event
     }
 
-    fn offset_phase(&self, offset_ms: i32) -> u64 {
-        self.offset_frames(offset_ms)
-            .saturating_mul(self.phase_increment)
+    fn apply_pattern_change(&mut self, pattern: Pattern) {
+        let Some(previous) = self.active_pattern.replace(pattern) else {
+            return;
+        };
+        if previous == pattern {
+            return;
+        }
+
+        // Swing changes retain event identity. If a slider moves an upcoming
+        // event behind the playhead, it is emitted once on the next frame.
+        if previous.beats_per_bar == pattern.beats_per_bar
+            && previous.beat_unit == pattern.beat_unit
+            && previous.subdivisions_per_beat == pattern.subdivisions_per_beat
+        {
+            return;
+        }
+
+        // Structural meter changes preserve the relative playhead position,
+        // then select the first event at or ahead of the current sample.
+        let previous_bar_length = self.bar_length_scaled(previous);
+        let new_bar_length = self.bar_length_scaled(pattern);
+        self.bar_phase_scaled = ((u128::from(self.bar_phase_scaled) * u128::from(new_bar_length))
+            / u128::from(previous_bar_length)) as u64;
+        self.next_event_ordinal = (0..pattern.events_per_bar())
+            .find(|&ordinal| self.event_phase_scaled(pattern, ordinal) >= self.bar_phase_scaled)
+            .unwrap_or(pattern.events_per_bar());
     }
 
-    fn offset_frames(&self, offset_ms: i32) -> u64 {
-        (u64::from(offset_ms.unsigned_abs()) * self.threshold) / 60_000_000
+    fn bar_length_scaled(&self, pattern: Pattern) -> u64 {
+        self.beat_threshold_scaled
+            .saturating_mul(u64::from(pattern.beats_per_bar))
     }
 
-    fn next_position(&self, beats_per_bar: u8, subdivisions_per_beat: u8) -> (u8, u8) {
-        let next_subdivision = self.subdivision_index + 1;
-        if next_subdivision >= subdivisions_per_beat {
-            ((self.beat_index + 1) % beats_per_bar, 0)
+    fn event_phase_scaled(&self, pattern: Pattern, ordinal: u16) -> u64 {
+        let straight = self
+            .beat_threshold_scaled
+            .saturating_mul(u64::from(ordinal))
+            / u64::from(pattern.subdivisions_per_beat);
+        let amount = i64::from(pattern.swing.amount_percent);
+        if amount == 0 {
+            return straight;
+        }
+
+        // Express the selected note value in notated-beat phase units. A
+        // complete swing pair spans two selected grid notes.
+        let grid = self
+            .beat_threshold_scaled
+            .saturating_mul(u64::from(pattern.beat_unit))
+            / pattern.swing.grid.denominator();
+        let pair_length = grid.saturating_mul(2);
+        let pair_start = (straight / pair_length) * pair_length;
+
+        // A partial pair at the end of a bar stays straight. Pairing restarts
+        // at every bar, which fixes the downbeat and prevents cumulative drift.
+        if pair_start.saturating_add(pair_length) > self.bar_length_scaled(pattern) {
+            return straight;
+        }
+
+        let local = straight - pair_start;
+        let first_weight = u64::try_from(100 + amount).expect("swing amount is normalized");
+        let second_weight = u64::try_from(100 - amount).expect("swing amount is normalized");
+        let warped_local = if local <= grid {
+            ((u128::from(local) * u128::from(first_weight)) / 100) as u64
         } else {
-            (self.beat_index, next_subdivision)
-        }
+            ((u128::from(grid) * u128::from(first_weight)
+                + u128::from(local - grid) * u128::from(second_weight))
+                / 100) as u64
+        };
+        pair_start + warped_local
     }
 
-    fn future_position(
-        &self,
-        beats_per_bar: u8,
-        subdivisions_per_beat: u8,
-        steps: u64,
-    ) -> (u8, u8) {
-        let subdivisions_per_bar = u64::from(beats_per_bar) * u64::from(subdivisions_per_beat);
-        let current = u64::from(self.beat_index) * u64::from(subdivisions_per_beat)
-            + u64::from(self.subdivision_index);
-        let future = (current + steps) % subdivisions_per_bar;
-        (
-            (future / u64::from(subdivisions_per_beat)) as u8,
-            (future % u64::from(subdivisions_per_beat)) as u8,
-        )
-    }
-
-    fn event_for(
-        &self,
-        beat_index: u8,
-        subdivision_index: u8,
-        beats_per_bar: u8,
-        subdivisions_per_beat: u8,
-    ) -> BeatEvent {
+    fn event_for(&self, pattern: Pattern, ordinal: u16) -> BeatEvent {
+        let subdivisions = u16::from(pattern.subdivisions_per_beat);
+        let beat_index = (ordinal / subdivisions) as u8;
+        let subdivision_index = (ordinal % subdivisions) as u8;
         BeatEvent {
             beat_index,
-            beats_per_bar,
+            beats_per_bar: pattern.beats_per_bar,
             subdivision_index,
-            subdivisions_per_beat,
+            subdivisions_per_beat: pattern.subdivisions_per_beat,
             is_accent: beat_index == 0 && subdivision_index == 0,
         }
     }
@@ -282,25 +277,35 @@ impl BeatScheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::{BeatEvent, BeatScheduler};
+    use super::{BeatEvent, BeatScheduler, SwingGrid, SwingSettings};
+
+    const SAMPLE_RATE: u32 = 48_000;
 
     fn collect_events(
         bpm_milli: u32,
+        beats_per_bar: u8,
         beat_unit: u8,
         subdivisions_per_beat: u8,
-        offset_ms: i32,
+        swing: SwingSettings,
         count: usize,
     ) -> Vec<(u64, BeatEvent)> {
-        let mut scheduler = BeatScheduler::new(48_000);
+        let mut scheduler = BeatScheduler::new(SAMPLE_RATE);
         scheduler.start();
 
         let mut events = Vec::new();
-        for frame in 0..(48_000 * 60) {
-            if let Some(event) =
-                scheduler.advance_frame(bpm_milli, 4, beat_unit, subdivisions_per_beat, offset_ms)
-            {
-                events.push((frame, event));
-            }
+        for frame in 0..u64::from(SAMPLE_RATE) * 600 {
+            scheduler.advance_frame(
+                bpm_milli,
+                beats_per_bar,
+                beat_unit,
+                subdivisions_per_beat,
+                swing,
+                |event| {
+                    if events.len() < count {
+                        events.push((frame, event));
+                    }
+                },
+            );
             if events.len() >= count {
                 break;
             }
@@ -308,146 +313,215 @@ mod tests {
         events
     }
 
-    fn collect_intervals(
-        bpm_milli: u32,
+    fn frames(
+        beats_per_bar: u8,
         beat_unit: u8,
         subdivisions_per_beat: u8,
-        offset_ms: i32,
+        grid: SwingGrid,
+        amount_percent: i16,
+        count: usize,
     ) -> Vec<u64> {
-        collect_events(bpm_milli, beat_unit, subdivisions_per_beat, offset_ms, 16)
-            .windows(2)
-            .map(|pair| pair[1].0 - pair[0].0)
-            .collect()
+        collect_events(
+            120_000,
+            beats_per_bar,
+            beat_unit,
+            subdivisions_per_beat,
+            SwingSettings::new(grid, amount_percent),
+            count,
+        )
+        .into_iter()
+        .map(|(frame, _)| frame)
+        .collect()
     }
 
     #[test]
-    fn produces_stable_120_bpm_intervals() {
-        let intervals = collect_intervals(120_000, 4, 1, 0);
-        assert!(!intervals.is_empty());
-        assert!(intervals.iter().all(|&interval| interval == 24_000));
+    fn zero_swing_is_identical_for_every_grid() {
+        let expected = frames(4, 4, 4, SwingGrid::Eighth, 0, 20);
+        assert_eq!(expected, frames(4, 4, 4, SwingGrid::Quarter, 0, 20));
+        assert_eq!(expected, frames(4, 4, 4, SwingGrid::Sixteenth, 0, 20));
+        assert!(expected.windows(2).all(|pair| pair[1] - pair[0] == 6_000));
     }
 
     #[test]
-    fn click_offset_does_not_change_tempo() {
-        let delayed = collect_intervals(120_000, 4, 1, 30);
-        let early = collect_intervals(120_000, 4, 1, -30);
-        assert!(delayed.iter().all(|&interval| interval == 24_000));
-        assert!(early.iter().skip(1).all(|&interval| interval == 24_000));
+    fn swing_extremes_overlap_the_previous_or_next_grid_point() {
+        let late = frames(4, 4, 2, SwingGrid::Eighth, 100, 5);
+        assert_eq!(late, vec![0, 24_000, 24_000, 48_000, 48_000]);
+
+        let early = frames(4, 4, 2, SwingGrid::Eighth, -100, 5);
+        assert_eq!(early, vec![0, 0, 24_000, 24_000, 48_000]);
     }
 
     #[test]
-    fn beat_unit_scales_the_click_interval() {
-        assert!(
-            collect_intervals(120_000, 2, 1, 0)
-                .iter()
-                .all(|&interval| interval == 48_000)
+    fn positive_extreme_preserves_the_bar_end_offbeat() {
+        let events = collect_events(
+            120_000,
+            4,
+            4,
+            2,
+            SwingSettings::new(SwingGrid::Eighth, 100),
+            9,
         );
-        assert!(
-            collect_intervals(120_000, 8, 1, 0)
-                .iter()
-                .all(|&interval| interval == 12_000)
-        );
-        assert!(
-            collect_intervals(120_000, 16, 1, 0)
-                .iter()
-                .all(|&interval| interval == 6_000)
-        );
+        assert_eq!(events[7].0, 96_000);
+        assert_eq!(events[8].0, 96_000);
+        assert!(!events[7].1.is_accent);
+        assert!(events[8].1.is_accent);
     }
 
     #[test]
-    fn subdivisions_two_through_eight_produce_even_clicks() {
-        for subdivisions in 2..=8 {
-            let expected = 24_000.0 / f64::from(subdivisions);
-            let intervals = collect_intervals(120_000, 4, subdivisions, 0);
-            assert!(!intervals.is_empty());
-            assert!(
-                intervals
-                    .iter()
-                    .all(|&interval| (interval as f64 - expected).abs() <= 1.0),
-                "subdivision {subdivisions} intervals: {intervals:?}"
-            );
-        }
+    fn quarter_eighth_and_sixteenth_grids_warp_the_selected_offbeat() {
+        let quarter = frames(4, 4, 4, SwingGrid::Quarter, 100, 9);
+        assert_eq!(quarter[4], 48_000);
+        assert_eq!(quarter[8], 48_000);
+
+        let eighth = frames(4, 4, 4, SwingGrid::Eighth, 100, 9);
+        assert_eq!(eighth[2], 24_000);
+        assert_eq!(eighth[4], 24_000);
+
+        let sixteenth = frames(4, 4, 4, SwingGrid::Sixteenth, 100, 9);
+        assert_eq!(sixteenth[1], 12_000);
+        assert_eq!(sixteenth[2], 12_000);
     }
 
     #[test]
-    fn click_offset_keeps_subdivision_tempo_stable() {
-        let delayed = collect_intervals(120_000, 4, 8, 30);
-        let early = collect_intervals(120_000, 4, 8, -30);
-        assert!(delayed.iter().all(|&interval| interval == 3_000));
-        assert!(early.iter().skip(1).all(|&interval| interval == 3_000));
-    }
-
-    #[test]
-    fn long_positive_offset_does_not_silence_high_bpm() {
-        for bpm_milli in [300_000, 301_000, 1_000_000] {
-            let intervals = collect_intervals(bpm_milli, 4, 1, 200);
-            assert!(
-                !intervals.is_empty(),
-                "BPM {} stopped producing clicks",
-                bpm_milli / 1_000
-            );
-        }
-    }
-
-    #[test]
-    fn long_positive_offset_does_not_silence_subdivisions() {
-        for subdivisions in 2..=8 {
-            let intervals = collect_intervals(120_000, 4, subdivisions, 200);
-            assert!(
-                !intervals.is_empty(),
-                "subdivision {subdivisions} stopped producing clicks"
-            );
-        }
-    }
-
-    #[test]
-    fn positive_offset_preserves_the_full_delay_across_subdivision_intervals() {
-        let on_grid = collect_events(120_000, 4, 8, 0, 12);
-        let delayed = collect_events(120_000, 4, 8, 100, 12);
-        assert_eq!(on_grid.len(), delayed.len());
-        for ((grid_frame, grid_event), (delayed_frame, delayed_event)) in
-            on_grid.iter().zip(&delayed)
+    fn bar_downbeats_stay_fixed_across_common_meters() {
+        for (beats_per_bar, beat_unit) in [(3, 3), (3, 4), (4, 4), (5, 5), (7, 7), (6, 8), (5, 16)]
         {
-            assert_eq!(delayed_frame - grid_frame, 4_800);
-            assert_eq!(delayed_event, grid_event);
+            let subdivisions = 5;
+            let events_per_bar = usize::from(beats_per_bar) * usize::from(subdivisions);
+            let events = collect_events(
+                120_000,
+                beats_per_bar,
+                beat_unit,
+                subdivisions,
+                SwingSettings::new(SwingGrid::Eighth, 100),
+                events_per_bar + 1,
+            );
+            let expected_bar_frames = 24_000 * u64::from(beats_per_bar) * 4 / u64::from(beat_unit);
+            assert_eq!(events[0].0, 0, "{beats_per_bar}/{beat_unit}");
+            assert_eq!(
+                events[events_per_bar].0, expected_bar_frames,
+                "{beats_per_bar}/{beat_unit}"
+            );
+            assert!(events[events_per_bar].1.is_accent);
         }
     }
 
     #[test]
-    fn negative_offset_advances_subdivision_identity_across_intervals() {
-        let early = collect_events(120_000, 4, 8, -100, 4);
-        assert_eq!(early[0].0, 0);
-        assert_eq!(early[0].1.subdivision_index, 0);
-        assert!(early[1].0.abs_diff(1_200) <= 1);
-        assert_eq!(early[1].1.subdivision_index, 2);
-        assert!(early[2].0.abs_diff(4_200) <= 1);
-        assert_eq!(early[2].1.subdivision_index, 3);
+    fn incomplete_pair_at_bar_end_stays_straight() {
+        // A 3/4 bar contains one complete pair of quarter notes and one
+        // unpaired quarter note. The third beat remains at its straight frame.
+        let events = frames(3, 4, 1, SwingGrid::Quarter, 100, 4);
+        assert_eq!(events, vec![0, 48_000, 48_000, 72_000]);
     }
 
     #[test]
-    fn subdivision_events_preserve_beat_and_accent_identity() {
-        let mut scheduler = BeatScheduler::new(48_000);
+    fn odd_subdivisions_are_piecewise_linearly_warped_without_drops() {
+        let events = collect_events(
+            120_000,
+            4,
+            4,
+            5,
+            SwingSettings::new(SwingGrid::Eighth, 100),
+            21,
+        );
+        assert_eq!(events.len(), 21);
+        assert_eq!(events[0].0, 0);
+        assert_eq!(events[5].0, 24_000);
+        assert_eq!(events[10].0, 48_000);
+        assert_eq!(events[20].0, 96_000);
+        assert!(events.windows(2).all(|pair| pair[0].0 <= pair[1].0));
+        for (ordinal, (_, event)) in events[..20].iter().enumerate() {
+            assert_eq!(
+                usize::from(event.beat_index) * 5 + usize::from(event.subdivision_index),
+                ordinal
+            );
+        }
+    }
+
+    #[test]
+    fn every_supported_subdivision_preserves_event_count_and_bar_length() {
+        for subdivisions in 1..=8 {
+            let count = 4 * usize::from(subdivisions) + 1;
+            let events = collect_events(
+                137_123,
+                4,
+                4,
+                subdivisions,
+                SwingSettings::new(SwingGrid::Sixteenth, -73),
+                count,
+            );
+            assert_eq!(events.len(), count, "subdivision {subdivisions}");
+            assert!(events.windows(2).all(|pair| pair[0].0 < pair[1].0));
+            let expected_bar_frames =
+                (u64::from(SAMPLE_RATE) * 60_000 * 4 * 4).div_ceil(u64::from(137_123_u32 * 4));
+            assert_eq!(events[count - 1].0, expected_bar_frames);
+        }
+    }
+
+    #[test]
+    fn long_run_has_no_cumulative_bar_drift() {
+        let bars = 1_000_u64;
+        let beats_per_bar = 7_u8;
+        let subdivisions = 7_u8;
+        let events_per_bar = usize::from(beats_per_bar) * usize::from(subdivisions);
+        let sample_rate = 1_000_u32;
+        let mut scheduler = BeatScheduler::new(sample_rate);
         scheduler.start();
-        let mut events = Vec::new();
-        for _ in 0..48_000 {
-            if let Some(event) = scheduler.advance_frame(120_000, 4, 4, 4, 0) {
-                events.push(event);
-            }
-            if events.len() == 5 {
+        let count = usize::try_from(bars).unwrap() * events_per_bar + 1;
+        let mut events = Vec::with_capacity(count);
+        for frame in 0..2_000_000_u64 {
+            scheduler.advance_frame(
+                120_000,
+                beats_per_bar,
+                8,
+                subdivisions,
+                SwingSettings::new(SwingGrid::Sixteenth, 100),
+                |event| {
+                    if events.len() < count {
+                        events.push((frame, event));
+                    }
+                },
+            );
+            if events.len() == count {
                 break;
             }
         }
+        let expected = 250 * u64::from(beats_per_bar) * bars;
+        assert_eq!(events.len(), count);
+        assert_eq!(events.last().unwrap().0, expected);
+        assert!(events.last().unwrap().1.is_accent);
+    }
 
-        assert_eq!(events[0].beat_index, 0);
-        assert_eq!(events[0].subdivision_index, 0);
-        assert!(events[0].is_accent);
-        for (index, event) in events[1..4].iter().enumerate() {
+    #[test]
+    fn amount_is_clamped_to_supported_range() {
+        assert_eq!(
+            frames(4, 4, 2, SwingGrid::Eighth, 999, 5),
+            frames(4, 4, 2, SwingGrid::Eighth, 100, 5)
+        );
+        assert_eq!(
+            frames(4, 4, 2, SwingGrid::Eighth, -999, 5),
+            frames(4, 4, 2, SwingGrid::Eighth, -100, 5)
+        );
+    }
+
+    #[test]
+    fn beat_identity_and_accent_are_preserved() {
+        let events = collect_events(
+            120_000,
+            4,
+            4,
+            4,
+            SwingSettings::new(SwingGrid::Eighth, 67),
+            5,
+        );
+        assert!(events[0].1.is_accent);
+        for (index, (_, event)) in events[1..4].iter().enumerate() {
             assert_eq!(event.beat_index, 0);
             assert_eq!(event.subdivision_index, index as u8 + 1);
             assert!(!event.is_accent);
         }
-        assert_eq!(events[4].beat_index, 1);
-        assert_eq!(events[4].subdivision_index, 0);
-        assert!(!events[4].is_accent);
+        assert_eq!(events[4].1.beat_index, 1);
+        assert_eq!(events[4].1.subdivision_index, 0);
+        assert!(!events[4].1.is_accent);
     }
 }

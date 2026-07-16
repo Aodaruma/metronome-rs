@@ -18,6 +18,32 @@ pub struct SampleBank {
     pub normal: Vec<f32>,
     pub accent: Vec<f32>,
     pub subdivision: Vec<f32>,
+    pub normal_transient: TransientAnalysis,
+    pub accent_transient: TransientAnalysis,
+    pub subdivision_transient: TransientAnalysis,
+}
+
+/// A reliable estimate of the first audible transient in a prepared sample.
+///
+/// Analysis is performed while constructing the sample bank, after resampling
+/// and before trimming, fading, or normalization. An unreliable result does
+/// not expose a position so it cannot accidentally be used as an automatic
+/// timing correction.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TransientAnalysis {
+    pub frame: Option<usize>,
+    pub milliseconds: Option<f32>,
+    pub reliable: bool,
+}
+
+impl TransientAnalysis {
+    const fn unreliable() -> Self {
+        Self {
+            frame: None,
+            milliseconds: None,
+            reliable: false,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -78,10 +104,17 @@ impl SampleBank {
             })
             .unwrap_or_else(|| normal.clone());
 
+        let normal = prepare_sample(normal, target_sample_rate);
+        let accent = prepare_sample(accent, target_sample_rate);
+        let subdivision = prepare_sample(subdivision, target_sample_rate);
+
         Ok(Self {
-            normal: prepare_sample(normal, target_sample_rate),
-            accent: prepare_sample(accent, target_sample_rate),
-            subdivision: prepare_sample(subdivision, target_sample_rate),
+            normal: normal.samples,
+            accent: accent.samples,
+            subdivision: subdivision.samples,
+            normal_transient: normal.transient,
+            accent_transient: accent.transient,
+            subdivision_transient: subdivision.transient,
         })
     }
 }
@@ -232,17 +265,115 @@ fn decode_wav_mono(bytes: &[u8]) -> Result<DecodedSample, SampleBankError> {
     })
 }
 
-fn prepare_sample(decoded: DecodedSample, target_sample_rate: u32) -> Vec<f32> {
+struct PreparedSample {
+    samples: Vec<f32>,
+    transient: TransientAnalysis,
+}
+
+fn prepare_sample(decoded: DecodedSample, target_sample_rate: u32) -> PreparedSample {
     let mut samples = if decoded.sample_rate == target_sample_rate {
         decoded.samples
     } else {
         resample_linear(&decoded.samples, decoded.sample_rate, target_sample_rate)
     };
 
+    let transient = analyze_first_transient(&samples, target_sample_rate);
     trim_to_two_seconds(&mut samples, target_sample_rate);
     apply_fade_out(&mut samples, target_sample_rate);
     normalize_peak(&mut samples, 0.85);
-    samples
+    PreparedSample { samples, transient }
+}
+
+/// Finds the first significant short attack in the first 500 ms of a sample.
+///
+/// A one-millisecond peak envelope retains click-like attacks without making a
+/// later, louder peak the timing reference. Reliability requires both enough
+/// contrast over the envelope's background floor and a sufficiently steep
+/// rise over a short interval. This deliberately rejects silence, steady
+/// noise, and slow fades, which are unsafe inputs for automatic correction.
+fn analyze_first_transient(samples: &[f32], sample_rate: u32) -> TransientAnalysis {
+    const ANALYSIS_MILLISECONDS: usize = 500;
+    const MIN_SIGNAL_PEAK: f32 = 1.0e-5;
+    const MIN_PEAK_TO_FLOOR_RATIO: f32 = 2.5;
+    const MIN_DYNAMIC_RANGE_FRACTION: f32 = 0.2;
+    const ONSET_THRESHOLD_FRACTION: f32 = 0.1;
+    const MIN_ATTACK_RISE_FRACTION: f32 = 0.15;
+    const ATTACK_MILLISECONDS: usize = 8;
+
+    if samples.is_empty() || sample_rate == 0 {
+        return TransientAnalysis::unreliable();
+    }
+
+    let analysis_len = samples.len().min(
+        (sample_rate as usize)
+            .saturating_mul(ANALYSIS_MILLISECONDS)
+            .div_ceil(1_000),
+    );
+    let envelope_frame_len = (sample_rate as usize / 1_000).max(1);
+    let envelope = samples[..analysis_len]
+        .chunks(envelope_frame_len)
+        .map(|frame| {
+            frame
+                .iter()
+                .map(|sample| sample.abs())
+                .fold(0.0_f32, f32::max)
+        })
+        .collect::<Vec<_>>();
+
+    if envelope.is_empty() {
+        return TransientAnalysis::unreliable();
+    }
+
+    let signal_peak = envelope.iter().copied().fold(0.0_f32, f32::max);
+    if !signal_peak.is_finite() || signal_peak < MIN_SIGNAL_PEAK {
+        return TransientAnalysis::unreliable();
+    }
+
+    let mut sorted_envelope = envelope.clone();
+    sorted_envelope.sort_by(f32::total_cmp);
+    let floor_index = (sorted_envelope.len() - 1) / 5;
+    let background_floor = sorted_envelope[floor_index];
+    let dynamic_range = signal_peak - background_floor;
+
+    let has_dynamic_range = dynamic_range >= signal_peak * MIN_DYNAMIC_RANGE_FRACTION;
+    let has_background_contrast = background_floor <= f32::EPSILON
+        || signal_peak >= background_floor * MIN_PEAK_TO_FLOOR_RATIO;
+    if !has_dynamic_range || !has_background_contrast {
+        return TransientAnalysis::unreliable();
+    }
+
+    let onset_threshold = background_floor + dynamic_range * ONSET_THRESHOLD_FRACTION;
+    let minimum_attack_rise = dynamic_range * MIN_ATTACK_RISE_FRACTION;
+    let attack_frames = ATTACK_MILLISECONDS.max(1);
+    let onset_envelope_frame = envelope.iter().enumerate().find_map(|(index, &level)| {
+        if level < onset_threshold {
+            return None;
+        }
+
+        let earlier_level = index
+            .checked_sub(attack_frames)
+            .and_then(|earlier| envelope.get(earlier).copied())
+            .unwrap_or(background_floor);
+        (level - earlier_level >= minimum_attack_rise).then_some(index)
+    });
+    let Some(onset_envelope_frame) = onset_envelope_frame else {
+        return TransientAnalysis::unreliable();
+    };
+
+    let envelope_start = onset_envelope_frame * envelope_frame_len;
+    let envelope_end = (envelope_start + envelope_frame_len).min(analysis_len);
+    let sample_threshold = background_floor + dynamic_range * ONSET_THRESHOLD_FRACTION;
+    let frame = samples[envelope_start..envelope_end]
+        .iter()
+        .position(|sample| sample.abs() >= sample_threshold)
+        .map(|within_envelope| envelope_start + within_envelope)
+        .unwrap_or(envelope_start);
+
+    TransientAnalysis {
+        frame: Some(frame),
+        milliseconds: Some(frame as f32 * 1_000.0 / sample_rate as f32),
+        reliable: true,
+    }
 }
 
 fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
@@ -305,7 +436,10 @@ fn normalize_peak(samples: &mut [f32], target_peak: f32) {
 mod tests {
     use std::path::Path;
 
-    use super::{SampleBank, builtin_wav, decode_wav_mono, validate_audio_file};
+    use super::{
+        DecodedSample, SampleBank, analyze_first_transient, builtin_wav, decode_wav_mono,
+        prepare_sample, validate_audio_file,
+    };
     use crate::config::{AppConfig, BuiltinSound};
 
     #[test]
@@ -342,5 +476,100 @@ mod tests {
             let decoded = decode_wav_mono(builtin_wav(sound)).expect("built-in WAV should decode");
             assert!(!decoded.samples.is_empty());
         }
+    }
+
+    #[test]
+    fn silence_has_no_reliable_transient() {
+        let analysis = analyze_first_transient(&vec![0.0; 24_000], 48_000);
+
+        assert!(!analysis.reliable);
+        assert_eq!(analysis.frame, None);
+        assert_eq!(analysis.milliseconds, None);
+    }
+
+    #[test]
+    fn stationary_noise_has_no_reliable_transient() {
+        let mut state = 0x1234_5678_u32;
+        let noise = (0..24_000)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let unit = (state >> 8) as f32 / 0x00ff_ffff_u32 as f32;
+                (unit * 2.0 - 1.0) * 0.02
+            })
+            .collect::<Vec<_>>();
+
+        let analysis = analyze_first_transient(&noise, 48_000);
+
+        assert!(!analysis.reliable);
+        assert_eq!(analysis.frame, None);
+        assert_eq!(analysis.milliseconds, None);
+    }
+
+    #[test]
+    fn slow_attack_has_no_reliable_transient() {
+        let sample_rate = 48_000;
+        let attack_frames = sample_rate * 300 / 1_000;
+        let samples = (0..sample_rate / 2)
+            .map(|frame| (frame as f32 / attack_frames as f32).min(1.0))
+            .collect::<Vec<_>>();
+
+        let analysis = analyze_first_transient(&samples, sample_rate as u32);
+
+        assert!(!analysis.reliable);
+        assert_eq!(analysis.frame, None);
+        assert_eq!(analysis.milliseconds, None);
+    }
+
+    #[test]
+    fn leading_silence_then_sharp_peak_reports_first_transient() {
+        let sample_rate = 48_000_u32;
+        let onset_frame = sample_rate as usize * 120 / 1_000;
+        let mut samples = vec![0.0; sample_rate as usize / 2];
+        samples[onset_frame] = 0.2;
+        samples[onset_frame + 1] = 0.15;
+        samples[onset_frame + 2] = 0.1;
+        // A later and larger-width event must not become the timing reference.
+        let later_frame = sample_rate as usize * 300 / 1_000;
+        samples[later_frame..later_frame + 48].fill(1.0);
+
+        let analysis = analyze_first_transient(&samples, sample_rate);
+
+        assert!(analysis.reliable);
+        assert_eq!(analysis.frame, Some(onset_frame));
+        assert_eq!(analysis.milliseconds, Some(120.0));
+    }
+
+    #[test]
+    fn preparation_analyzes_after_resampling_and_before_normalization() {
+        let source_rate = 24_000_u32;
+        let target_rate = 48_000_u32;
+        let onset_frame = source_rate as usize / 10;
+        let mut samples = vec![0.0; source_rate as usize / 2];
+        samples[onset_frame] = 0.02;
+        samples[onset_frame + 1] = 0.01;
+
+        let prepared = prepare_sample(
+            DecodedSample {
+                sample_rate: source_rate,
+                samples,
+            },
+            target_rate,
+        );
+
+        assert!(prepared.transient.reliable);
+        let detected_frame = prepared.transient.frame.expect("transient frame");
+        assert!(detected_frame.abs_diff(onset_frame * 2) <= 1);
+        let detected_ms = prepared
+            .transient
+            .milliseconds
+            .expect("transient milliseconds");
+        assert!((detected_ms - 100.0).abs() < 0.03);
+        let prepared_peak = prepared
+            .samples
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max);
+        assert!((prepared_peak - 0.85).abs() < f32::EPSILON * 4.0);
     }
 }
