@@ -1,5 +1,7 @@
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-use crate::config::{BackgroundConfig, Language, ShortcutConfig};
+use crate::config::{
+    AppConfig, BackgroundConfig, Language, LanguageMode, MeterMode, ShortcutConfig, ThemeMode,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuCommand {
@@ -23,6 +25,7 @@ pub enum MenuCommand {
     ShowPresets,
     ShowMetronome,
     ShowPreferences,
+    ToggleAlwaysOnTop,
     MeterArc,
     MeterBeatRing,
     ThemeSystem,
@@ -61,13 +64,34 @@ pub struct NativeMenu {
     global_toggle_window: muda::MenuItem,
     #[cfg(any(target_os = "windows", target_os = "macos"))]
     global_toggle_playback: muda::MenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    always_on_top: muda::CheckMenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    meter_arc: muda::CheckMenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    meter_beat_ring: muda::CheckMenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    theme_system: muda::CheckMenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    theme_dark: muda::CheckMenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    theme_light: muda::CheckMenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    language_system: muda::CheckMenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    language_japanese: muda::CheckMenuItem,
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    language_english: muda::CheckMenuItem,
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod native {
-    use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+    use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 
-    use super::{BackgroundConfig, Language, MenuCommand, NativeMenu, ShortcutConfig};
+    use super::{
+        AppConfig, BackgroundConfig, Language, LanguageMode, MenuCommand, MeterMode, NativeMenu,
+        ShortcutConfig, ThemeMode,
+    };
     use crate::config::Language::{English, Japanese};
 
     const MENU_SAVE_SETTINGS: &str = "file.save_settings";
@@ -90,6 +114,7 @@ mod native {
     const MENU_SHOW_PRESETS: &str = "presets.manage";
     const MENU_SHOW_METRONOME: &str = "view.metronome";
     const MENU_SHOW_PREFERENCES: &str = "view.preferences";
+    const MENU_ALWAYS_ON_TOP: &str = "view.always_on_top";
     const MENU_SHOW_SHORTCUT_SETTINGS: &str = "shortcuts.settings";
     const MENU_METER_ARC: &str = "view.meter_arc";
     const MENU_METER_BEAT_RING: &str = "view.meter_beat_ring";
@@ -105,9 +130,14 @@ mod native {
         pub fn new(
             cc: &eframe::CreationContext<'_>,
             language: Language,
-            shortcuts: &ShortcutConfig,
-            background: &BackgroundConfig,
+            config: &AppConfig,
         ) -> Result<Self, String> {
+            let language_mode = config.language;
+            let theme = config.theme;
+            let meter_mode = config.meter_mode;
+            let shortcuts = &config.shortcuts;
+            let background = &config.background;
+            let always_on_top = config.appearance.always_on_top;
             let save_settings = item(MENU_SAVE_SETTINGS, language, "設定を保存", "Save settings");
             let choose_normal_sound = item(
                 MENU_CHOOSE_NORMAL_SOUND,
@@ -197,38 +227,68 @@ mod native {
 
             let show_metronome = item(MENU_SHOW_METRONOME, language, "メトロノーム", "Metronome");
             let show_preferences = item(MENU_SHOW_PREFERENCES, language, "環境設定", "Preferences");
-            let meter_arc = item(MENU_METER_ARC, language, "円弧モード", "Arc mode");
-            let meter_beat_ring = item(
+            let always_on_top = CheckMenuItem::with_id(
+                MENU_ALWAYS_ON_TOP,
+                label(language, "常に最前面", "Always on top"),
+                true,
+                always_on_top,
+                None,
+            );
+            let meter_arc = check_item(
+                MENU_METER_ARC,
+                language,
+                "円弧モード",
+                "Arc mode",
+                meter_mode == MeterMode::Arc,
+            );
+            let meter_beat_ring = check_item(
                 MENU_METER_BEAT_RING,
                 language,
                 "円形モード",
                 "Beat-ring mode",
+                meter_mode == MeterMode::Circle,
             );
-            let theme_system = item(
+            let theme_system = check_item(
                 MENU_THEME_SYSTEM,
                 language,
                 "テーマ: システム設定",
                 "Theme: System",
+                theme == ThemeMode::System,
             );
-            let theme_dark = item(MENU_THEME_DARK, language, "テーマ: ダーク", "Theme: Dark");
-            let theme_light = item(MENU_THEME_LIGHT, language, "テーマ: ライト", "Theme: Light");
-            let language_system = item(
+            let theme_dark = check_item(
+                MENU_THEME_DARK,
+                language,
+                "テーマ: ダーク",
+                "Theme: Dark",
+                theme == ThemeMode::Dark,
+            );
+            let theme_light = check_item(
+                MENU_THEME_LIGHT,
+                language,
+                "テーマ: ライト",
+                "Theme: Light",
+                theme == ThemeMode::Light,
+            );
+            let language_system = check_item(
                 MENU_LANGUAGE_SYSTEM,
                 language,
                 "言語: システム設定",
                 "Language: System",
+                language_mode == LanguageMode::System,
             );
-            let language_japanese = item(
+            let language_japanese = check_item(
                 MENU_LANGUAGE_JAPANESE,
                 language,
                 "言語: 日本語",
                 "Language: Japanese",
+                language_mode == LanguageMode::Japanese,
             );
-            let language_english = item(
+            let language_english = check_item(
                 MENU_LANGUAGE_ENGLISH,
                 language,
                 "言語: English",
                 "Language: English",
+                language_mode == LanguageMode::English,
             );
             let about = item(
                 MENU_ABOUT,
@@ -341,6 +401,7 @@ mod native {
                 &[
                     &show_metronome,
                     &show_preferences,
+                    &always_on_top,
                     &PredefinedMenuItem::separator(),
                     &meter_arc,
                     &meter_beat_ring,
@@ -400,7 +461,41 @@ mod native {
                 shortcut_bpm_down_10,
                 global_toggle_window,
                 global_toggle_playback,
+                always_on_top,
+                meter_arc,
+                meter_beat_ring,
+                theme_system,
+                theme_dark,
+                theme_light,
+                language_system,
+                language_japanese,
+                language_english,
             })
+        }
+
+        pub fn update_always_on_top(&self, always_on_top: bool) {
+            self.always_on_top.set_checked(always_on_top);
+        }
+
+        pub fn update_meter_mode(&self, meter_mode: MeterMode) {
+            self.meter_arc.set_checked(meter_mode == MeterMode::Arc);
+            self.meter_beat_ring
+                .set_checked(meter_mode == MeterMode::Circle);
+        }
+
+        pub fn update_theme(&self, theme: ThemeMode) {
+            self.theme_system.set_checked(theme == ThemeMode::System);
+            self.theme_dark.set_checked(theme == ThemeMode::Dark);
+            self.theme_light.set_checked(theme == ThemeMode::Light);
+        }
+
+        pub fn update_language(&self, language: LanguageMode) {
+            self.language_system
+                .set_checked(language == LanguageMode::System);
+            self.language_japanese
+                .set_checked(language == LanguageMode::Japanese);
+            self.language_english
+                .set_checked(language == LanguageMode::English);
         }
 
         pub fn update_shortcuts(
@@ -509,6 +604,7 @@ mod native {
                     MENU_SHOW_METRONOME => MenuCommand::ShowMetronome,
                     MENU_SHOW_PREFERENCES => MenuCommand::ShowPreferences,
                     MENU_SHOW_SHORTCUT_SETTINGS => MenuCommand::ShowPreferences,
+                    MENU_ALWAYS_ON_TOP => MenuCommand::ToggleAlwaysOnTop,
                     MENU_METER_ARC => MenuCommand::MeterArc,
                     MENU_METER_BEAT_RING => MenuCommand::MeterBeatRing,
                     MENU_THEME_SYSTEM => MenuCommand::ThemeSystem,
@@ -533,6 +629,16 @@ mod native {
         english: &'static str,
     ) -> MenuItem {
         MenuItem::with_id(id, label(language, japanese, english), true, None)
+    }
+
+    fn check_item(
+        id: &'static str,
+        language: Language,
+        japanese: &'static str,
+        english: &'static str,
+        checked: bool,
+    ) -> CheckMenuItem {
+        CheckMenuItem::with_id(id, label(language, japanese, english), true, checked, None)
     }
 
     fn shortcut_label(
@@ -626,4 +732,12 @@ impl NativeMenu {
         _background: &crate::config::BackgroundConfig,
     ) {
     }
+
+    pub fn update_always_on_top(&self, _always_on_top: bool) {}
+
+    pub fn update_meter_mode(&self, _meter_mode: crate::config::MeterMode) {}
+
+    pub fn update_theme(&self, _theme: crate::config::ThemeMode) {}
+
+    pub fn update_language(&self, _language: crate::config::LanguageMode) {}
 }
