@@ -8,15 +8,19 @@ use serde::{Deserialize, Serialize};
 pub const APP_NAME: &str = "metronome-rs";
 pub const BPM_MIN: u32 = 20_000;
 pub const BPM_MAX: u32 = 1_000_000;
+pub const BEAT_UNIT_MIN: u8 = 1;
+pub const BEAT_UNIT_MAX: u8 = u8::MAX;
 pub const CLICK_OFFSET_MIN_MS: i32 = -200;
 pub const CLICK_OFFSET_MAX_MS: i32 = 200;
+pub const SWING_AMOUNT_MIN: i16 = -100;
+pub const SWING_AMOUNT_MAX: i16 = 100;
 pub const OUTPUT_VOLUME_DB_MIN: f32 = -60.0;
 pub const OUTPUT_VOLUME_DB_MAX: f32 = 12.0;
 pub const BPM_DRAG_SENSITIVITY_DEFAULT: f32 = 1.0 / 3.0;
 pub const TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT: f32 = 0.1;
 pub const DRAG_SENSITIVITY_MIN: f32 = 0.05;
 pub const DRAG_SENSITIVITY_MAX: f32 = 2.0;
-const CONFIG_SCHEMA_VERSION: u32 = 3;
+const CONFIG_SCHEMA_VERSION: u32 = 4;
 const PRESET_SEED_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,25 +123,57 @@ pub struct InteractionConfig {
 pub struct AppearanceConfig {
     pub accent_rgb: [u8; 3],
     pub accent_center_flash: bool,
+    pub always_on_top: bool,
+    pub background_image_path: Option<PathBuf>,
+    pub background_image_opacity_percent: u8,
+    pub background_image_blur_percent: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AudioConfig {
-    pub click_timing_offset_ms: i32,
+    #[serde(rename = "click_timing_offset_ms", skip_serializing)]
+    pub legacy_click_timing_offset_ms: Option<i32>,
     #[serde(alias = "output_boost_db")]
     pub output_volume_db: f32,
     pub subdivision: u8,
+    pub swing: SwingConfig,
 }
 
 impl Default for AudioConfig {
     fn default() -> Self {
         Self {
-            click_timing_offset_ms: 0,
+            legacy_click_timing_offset_ms: None,
             output_volume_db: 0.0,
             subdivision: 1,
+            swing: SwingConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SwingConfig {
+    pub grid: SwingGrid,
+    pub amount_percent: i16,
+}
+
+impl Default for SwingConfig {
+    fn default() -> Self {
+        Self {
+            grid: SwingGrid::Eighth,
+            amount_percent: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SwingGrid {
+    Quarter,
+    #[default]
+    Eighth,
+    Sixteenth,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +189,7 @@ pub struct SoundConfig {
     pub normal_volume_percent: u8,
     pub accent_volume_percent: u8,
     pub subdivision_volume_percent: u8,
+    pub timing_calibrations: Vec<SoundTimingCalibration>,
 }
 
 impl Default for SoundConfig {
@@ -168,11 +205,32 @@ impl Default for SoundConfig {
             normal_volume_percent: 70,
             accent_volume_percent: 70,
             subdivision_volume_percent: 42,
+            timing_calibrations: Vec::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum SoundSourceId {
+    Builtin(BuiltinSound),
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SoundTimingCalibration {
+    pub source: SoundSourceId,
+    pub manual_offset_ms: i32,
+    pub auto_align_transient: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SoundTimingSettings {
+    pub manual_offset_ms: i32,
+    pub auto_align_transient: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum BuiltinSound {
     Sin1,
@@ -184,6 +242,70 @@ pub enum BuiltinSound {
 impl CloseBehavior {
     pub fn keeps_running(self) -> bool {
         self == Self::KeepRunning
+    }
+}
+
+impl SoundConfig {
+    pub fn normal_source_id(&self) -> SoundSourceId {
+        self.normal_path
+            .clone()
+            .map(SoundSourceId::File)
+            .unwrap_or(SoundSourceId::Builtin(self.normal_builtin))
+    }
+
+    pub fn accent_source_id(&self) -> SoundSourceId {
+        self.accent_path
+            .clone()
+            .map(SoundSourceId::File)
+            .unwrap_or(SoundSourceId::Builtin(self.accent_builtin))
+    }
+
+    pub fn subdivision_source_id(&self) -> SoundSourceId {
+        if let Some(path) = &self.subdivision_path {
+            SoundSourceId::File(path.clone())
+        } else if let Some(sound) = self.subdivision_builtin {
+            SoundSourceId::Builtin(sound)
+        } else {
+            self.normal_source_id()
+        }
+    }
+
+    pub fn timing_for(&self, source: &SoundSourceId) -> SoundTimingSettings {
+        self.timing_calibrations
+            .iter()
+            .find(|calibration| &calibration.source == source)
+            .map(|calibration| SoundTimingSettings {
+                manual_offset_ms: calibration.manual_offset_ms,
+                auto_align_transient: calibration.auto_align_transient,
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set_timing_for(&mut self, source: SoundSourceId, settings: SoundTimingSettings) {
+        let settings = SoundTimingSettings {
+            manual_offset_ms: settings
+                .manual_offset_ms
+                .clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS),
+            auto_align_transient: settings.auto_align_transient,
+        };
+        if let Some(calibration) = self
+            .timing_calibrations
+            .iter_mut()
+            .find(|calibration| calibration.source == source)
+        {
+            calibration.manual_offset_ms = settings.manual_offset_ms;
+            calibration.auto_align_transient = settings.auto_align_transient;
+        } else {
+            self.timing_calibrations.push(SoundTimingCalibration {
+                source,
+                manual_offset_ms: settings.manual_offset_ms,
+                auto_align_transient: settings.auto_align_transient,
+            });
+        }
+        if self.timing_calibrations.len() > 64 {
+            let excess = self.timing_calibrations.len() - 64;
+            self.timing_calibrations.drain(..excess);
+        }
     }
 }
 
@@ -224,6 +346,10 @@ impl Default for AppearanceConfig {
         Self {
             accent_rgb: [0, 122, 170],
             accent_center_flash: false,
+            always_on_top: false,
+            background_image_path: None,
+            background_image_opacity_percent: 100,
+            background_image_blur_percent: 0,
         }
     }
 }
@@ -279,9 +405,10 @@ impl AppConfig {
         let source_schema_version = self.schema_version;
         self.bpm_milli = self.bpm_milli.clamp(BPM_MIN, BPM_MAX);
         self.time_signature.beats_per_bar = self.time_signature.beats_per_bar.clamp(1, 16);
-        if !matches!(self.time_signature.beat_unit, 2 | 4 | 8 | 16) {
-            self.time_signature.beat_unit = 4;
-        }
+        self.time_signature.beat_unit = self
+            .time_signature
+            .beat_unit
+            .clamp(BEAT_UNIT_MIN, BEAT_UNIT_MAX);
         self.volume_percent = self.volume_percent.min(100);
         for preset in &mut self.presets {
             preset.name = preset.name.trim().to_owned();
@@ -292,9 +419,11 @@ impl AppConfig {
             self.add_missing_default_presets();
         }
         self.presets.truncate(32);
-        self.audio.click_timing_offset_ms = self
+        let legacy_click_offset = self
             .audio
-            .click_timing_offset_ms
+            .legacy_click_timing_offset_ms
+            .take()
+            .unwrap_or(0)
             .clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS);
         if !self.audio.output_volume_db.is_finite() {
             self.audio.output_volume_db = 0.0;
@@ -304,6 +433,11 @@ impl AppConfig {
             .output_volume_db
             .clamp(OUTPUT_VOLUME_DB_MIN, OUTPUT_VOLUME_DB_MAX);
         self.audio.subdivision = self.audio.subdivision.clamp(1, 8);
+        self.audio.swing.amount_percent = self
+            .audio
+            .swing
+            .amount_percent
+            .clamp(SWING_AMOUNT_MIN, SWING_AMOUNT_MAX);
         if source_schema_version < 3 {
             self.sound.normal_volume_percent = self.volume_percent;
             self.sound.accent_volume_percent = self.volume_percent;
@@ -313,6 +447,37 @@ impl AppConfig {
         self.sound.normal_volume_percent = self.sound.normal_volume_percent.min(100);
         self.sound.accent_volume_percent = self.sound.accent_volume_percent.min(100);
         self.sound.subdivision_volume_percent = self.sound.subdivision_volume_percent.min(100);
+        let mut timing_calibrations: Vec<SoundTimingCalibration> =
+            Vec::with_capacity(self.sound.timing_calibrations.len().min(64));
+        for mut calibration in self.sound.timing_calibrations.drain(..) {
+            calibration.manual_offset_ms = calibration
+                .manual_offset_ms
+                .clamp(CLICK_OFFSET_MIN_MS, CLICK_OFFSET_MAX_MS);
+            if let Some(existing) = timing_calibrations
+                .iter_mut()
+                .find(|existing| existing.source == calibration.source)
+            {
+                *existing = calibration;
+            } else if timing_calibrations.len() < 64 {
+                timing_calibrations.push(calibration);
+            }
+        }
+        self.sound.timing_calibrations = timing_calibrations;
+        if source_schema_version < 4 {
+            for source in [
+                self.sound.normal_source_id(),
+                self.sound.accent_source_id(),
+                self.sound.subdivision_source_id(),
+            ] {
+                self.sound.set_timing_for(
+                    source,
+                    SoundTimingSettings {
+                        manual_offset_ms: legacy_click_offset,
+                        auto_align_transient: false,
+                    },
+                );
+            }
+        }
         self.background.toggle_window_shortcut =
             self.background.toggle_window_shortcut.trim().to_owned();
         self.background.toggle_playback_shortcut =
@@ -330,6 +495,18 @@ impl AppConfig {
             self.interaction.time_signature_drag_sensitivity,
             TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT,
         );
+        if self
+            .appearance
+            .background_image_path
+            .as_ref()
+            .is_some_and(|path| path.as_os_str().is_empty())
+        {
+            self.appearance.background_image_path = None;
+        }
+        self.appearance.background_image_opacity_percent =
+            self.appearance.background_image_opacity_percent.min(100);
+        self.appearance.background_image_blur_percent =
+            self.appearance.background_image_blur_percent.min(100);
         self.schema_version = CONFIG_SCHEMA_VERSION;
     }
 
@@ -441,10 +618,13 @@ pub fn save_config(config: &AppConfig) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
         AppConfig, BPM_DRAG_SENSITIVITY_DEFAULT, BPM_MAX, BpmPreset, BuiltinSound,
         CONFIG_SCHEMA_VERSION, DRAG_SENSITIVITY_MAX, LanguageMode, OUTPUT_VOLUME_DB_MAX,
-        OUTPUT_VOLUME_DB_MIN, TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT,
+        OUTPUT_VOLUME_DB_MIN, SWING_AMOUNT_MAX, SoundSourceId, SoundTimingSettings, SwingGrid,
+        TIME_SIGNATURE_DRAG_SENSITIVITY_DEFAULT,
     };
 
     #[test]
@@ -469,6 +649,8 @@ mod tests {
         assert_eq!(config.shortcuts.bpm_down_10, "Shift+ArrowDown");
         assert_eq!(config.audio.output_volume_db, 0.0);
         assert_eq!(config.audio.subdivision, 1);
+        assert_eq!(config.audio.swing.grid, SwingGrid::Eighth);
+        assert_eq!(config.audio.swing.amount_percent, 0);
         assert!(config.sound.accent_enabled);
         assert_eq!(config.sound.normal_volume_percent, 70);
         assert_eq!(config.sound.accent_volume_percent, 70);
@@ -479,6 +661,10 @@ mod tests {
         assert_eq!(config.sound.normal_builtin, BuiltinSound::Sin2);
         assert_eq!(config.sound.accent_builtin, BuiltinSound::Sin1);
         assert!(config.sound.subdivision_builtin.is_none());
+        assert!(!config.appearance.always_on_top);
+        assert!(config.appearance.background_image_path.is_none());
+        assert_eq!(config.appearance.background_image_opacity_percent, 100);
+        assert_eq!(config.appearance.background_image_blur_percent, 0);
     }
 
     #[test]
@@ -493,6 +679,31 @@ mod tests {
         config.bpm_milli = 1_001_000;
         config.sanitize();
         assert_eq!(config.bpm_milli, BPM_MAX);
+    }
+
+    #[test]
+    fn arbitrary_positive_beat_units_are_preserved() {
+        let mut config = AppConfig::default();
+        for beat_unit in [3, 5, 7, 255] {
+            config.time_signature.beat_unit = beat_unit;
+            config.sanitize();
+            assert_eq!(config.time_signature.beat_unit, beat_unit);
+        }
+        config.time_signature.beat_unit = 0;
+        config.sanitize();
+        assert_eq!(config.time_signature.beat_unit, 1);
+    }
+
+    #[test]
+    fn empty_background_image_path_is_treated_as_unset() {
+        let mut config = AppConfig::default();
+        config.appearance.background_image_path = Some(PathBuf::new());
+        config.appearance.background_image_opacity_percent = 200;
+        config.appearance.background_image_blur_percent = 150;
+        config.sanitize();
+        assert!(config.appearance.background_image_path.is_none());
+        assert_eq!(config.appearance.background_image_opacity_percent, 100);
+        assert_eq!(config.appearance.background_image_blur_percent, 100);
     }
 
     #[test]
@@ -524,12 +735,14 @@ mod tests {
         let mut config = AppConfig::default();
         config.audio.output_volume_db = 99.0;
         config.audio.subdivision = 0;
+        config.audio.swing.amount_percent = 999;
         config.sound.normal_volume_percent = 200;
         config.sound.accent_volume_percent = 150;
         config.sound.subdivision_volume_percent = 101;
         config.sanitize();
         assert_eq!(config.audio.output_volume_db, OUTPUT_VOLUME_DB_MAX);
         assert_eq!(config.audio.subdivision, 1);
+        assert_eq!(config.audio.swing.amount_percent, SWING_AMOUNT_MAX);
         assert_eq!(config.sound.normal_volume_percent, 100);
         assert_eq!(config.sound.accent_volume_percent, 100);
         assert_eq!(config.sound.subdivision_volume_percent, 100);
@@ -573,6 +786,57 @@ mod tests {
         let saved = serde_json::to_string(&config).expect("config should serialize");
         assert!(saved.contains("output_volume_db"));
         assert!(!saved.contains("output_boost_db"));
+    }
+
+    #[test]
+    fn legacy_global_click_offset_migrates_to_selected_sources() {
+        let json = r#"{
+            "schema_version": 3,
+            "sound": {
+                "normal_builtin": "sin2",
+                "accent_builtin": "sin1",
+                "subdivision_builtin": null
+            },
+            "audio": { "click_timing_offset_ms": -37 }
+        }"#;
+
+        let mut config = serde_json::from_str::<AppConfig>(json).expect("config should migrate");
+        config.sanitize();
+
+        for source in [
+            SoundSourceId::Builtin(BuiltinSound::Sin1),
+            SoundSourceId::Builtin(BuiltinSound::Sin2),
+        ] {
+            assert_eq!(
+                config.sound.timing_for(&source),
+                SoundTimingSettings {
+                    manual_offset_ms: -37,
+                    auto_align_transient: false,
+                }
+            );
+        }
+        assert_eq!(config.sound.timing_calibrations.len(), 2);
+        let saved = serde_json::to_string(&config).expect("config should serialize");
+        assert!(!saved.contains("click_timing_offset_ms"));
+    }
+
+    #[test]
+    fn source_timing_is_shared_and_clamped_by_source_identity() {
+        let mut config = AppConfig::default();
+        let source = config.sound.normal_source_id();
+        assert_eq!(source, config.sound.subdivision_source_id());
+
+        config.sound.set_timing_for(
+            source.clone(),
+            SoundTimingSettings {
+                manual_offset_ms: 999,
+                auto_align_transient: true,
+            },
+        );
+
+        let settings = config.sound.timing_for(&source);
+        assert_eq!(settings.manual_offset_ms, super::CLICK_OFFSET_MAX_MS);
+        assert!(settings.auto_align_transient);
     }
 
     #[test]
