@@ -39,6 +39,7 @@ const NORMAL_BACKGROUND_BLUR_MAX_SIGMA: f32 = 24.0;
 const PREFERENCES_BACKGROUND_ALPHA: u8 = 150;
 const ARC_START_ANGLE: f32 = std::f32::consts::FRAC_PI_2 * 1.5;
 const ARC_SWEEP_ANGLE: f32 = std::f32::consts::TAU * 0.75;
+const CIRCLE_DOT_OPTICAL_OUTSET: f32 = 3.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppTab {
@@ -2783,7 +2784,7 @@ impl MetronomeApp {
 
         painter.add(egui::Shape::line(
             arc_points(center, radius, start_angle, sweep_angle, 36),
-            egui::Stroke::new(7.0, visuals.widgets.inactive.bg_fill),
+            theme::meter_track_stroke(&visuals),
         ));
         let active_subdivision = self.last_beat.and_then(|beat| {
             let subdivisions = self.config.audio.subdivision;
@@ -2893,21 +2894,18 @@ impl MetronomeApp {
         })
         .inner;
         let painter = ui.painter_at(rect);
-        let center = rect.center() + egui::vec2(0.0, -4.0);
-        let radius = rect.width().min(rect.height()) * 0.32;
+        let geometry = circle_meter_geometry(rect, ui.ctx().pixels_per_point());
+        let center = geometry.center;
+        let radius = geometry.radius;
         let beats = self.config.time_signature.beats_per_bar.max(1);
         let current = self.last_beat.map_or(0, |beat| beat.beat_index);
 
-        painter.circle_stroke(
-            center,
-            radius,
-            egui::Stroke::new(2.0, ui.visuals().weak_text_color()),
-        );
+        painter.circle_stroke(center, radius, theme::meter_track_stroke(ui.visuals()));
         paint_circle_subdivision_guides(
             &painter,
             CircleSubdivisionGuides {
                 center,
-                radius,
+                radius: radius + CIRCLE_DOT_OPTICAL_OUTSET,
                 beats,
                 subdivisions: self.config.audio.subdivision,
                 active_subdivision: self.last_beat.and_then(|beat| {
@@ -2916,31 +2914,29 @@ impl MetronomeApp {
                         .then_some((beat.beat_index, beat.subdivision_index))
                 }),
                 style: SubdivisionGuideStyle {
-                    color: ui.visuals().weak_text_color(),
+                    color: theme::meter_inactive_beat_color(ui.visuals()),
                     active_color: ui.visuals().selection.bg_fill,
                     pulse: subdivision_pulse,
                 },
             },
         );
         for index in 0..beats {
-            let angle = -std::f32::consts::FRAC_PI_2
-                + std::f32::consts::TAU * (f32::from(index) / f32::from(beats));
-            let pos = center + egui::vec2(angle.cos(), angle.sin()) * radius;
+            let pos = circle_meter_position(geometry, index, beats, CIRCLE_DOT_OPTICAL_OUTSET);
             let active = index == current;
             let first = index == 0;
             let dot_radius = if active {
                 14.0 + 6.0 * pulse
             } else if first {
-                11.0
+                9.0
             } else {
-                8.0
+                6.0
             };
             let color = if active {
                 ui.visuals().selection.bg_fill
             } else if first {
                 ui.visuals().strong_text_color()
             } else {
-                ui.visuals().widgets.inactive.bg_fill
+                theme::meter_inactive_beat_color(ui.visuals())
             };
             painter.circle_filled(pos, dot_radius, color);
         }
@@ -3039,16 +3035,29 @@ impl MetronomeApp {
             .max(42.0);
         let editor_width = (button_offset * 2.0 - button_size - 8.0).max(66.0);
         let editor_height = 44.0 * scale;
+        let bpm_font = egui::FontId::new(40.0 * scale, regular_family());
+        let bpm_galley = ui.painter().layout_no_wrap(
+            bpm.to_string(),
+            bpm_font.clone(),
+            ui.visuals().text_color(),
+        );
+        let bpm_axis_y = center.y - 5.0;
+        let optical_offset = optical_center_offset(bpm_galley.rect, bpm_galley.mesh_bounds);
+        // DragValue adds its own atom-layout centering on top of the font line box.
+        // Compensate for that control-specific bias after centering the actual digit ink.
+        let drag_value_center_bias = -3.5 * scale;
         let editor_rect = egui::Rect::from_center_size(
-            center + egui::vec2(0.0, -3.0),
+            egui::pos2(
+                center.x,
+                bpm_axis_y + optical_offset + drag_value_center_bias,
+            ),
             egui::vec2(editor_width, editor_height),
         );
         let response = ui
             .scope(|ui| {
-                ui.style_mut().text_styles.insert(
-                    egui::TextStyle::Heading,
-                    egui::FontId::proportional(40.0 * scale),
-                );
+                ui.style_mut()
+                    .text_styles
+                    .insert(egui::TextStyle::Heading, bpm_font);
                 ui.style_mut().drag_value_text_style = egui::TextStyle::Heading;
                 ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
                 ui.style_mut().visuals.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
@@ -3080,7 +3089,7 @@ impl MetronomeApp {
             1
         };
         let minus_rect = egui::Rect::from_center_size(
-            center + egui::vec2(-button_offset, -5.0),
+            egui::pos2(center.x - button_offset, bpm_axis_y),
             egui::Vec2::splat(button_size),
         );
         if flat_round_icon_button_at(
@@ -3095,7 +3104,7 @@ impl MetronomeApp {
             self.adjust_bpm(-step);
         }
         let plus_rect = egui::Rect::from_center_size(
-            center + egui::vec2(button_offset, -5.0),
+            egui::pos2(center.x + button_offset, bpm_axis_y),
             egui::Vec2::splat(button_size),
         );
         if flat_round_icon_button_at(
@@ -3164,7 +3173,7 @@ impl MetronomeApp {
         let numerator_changed = numerator_response.changed();
         numerator_response.on_hover_text(tr(
             self.language(),
-            "拍子の分子（1〜16）",
+            "拍子の分子（1から16）",
             "Time-signature numerator (1–16)",
         ));
         if numerator_changed {
@@ -3174,13 +3183,56 @@ impl MetronomeApp {
         let denominator_changed = denominator_response.changed();
         denominator_response.on_hover_text(tr(
             self.language(),
-            "拍子の分母（1〜255、奇数も入力可）",
+            "拍子の分母（1から255、奇数も入力可）",
             "Time-signature denominator (1–255, including odd values)",
         ));
         if denominator_changed {
             self.set_beat_unit(normalize_beat_unit(beat_unit));
         }
     }
+}
+
+fn optical_center_offset(layout_bounds: egui::Rect, ink_bounds: egui::Rect) -> f32 {
+    let correction = layout_bounds.center().y - ink_bounds.center().y;
+    if correction.is_finite() {
+        correction.clamp(-4.0, 4.0)
+    } else {
+        0.0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CircleMeterGeometry {
+    center: egui::Pos2,
+    radius: f32,
+}
+
+fn circle_meter_geometry(rect: egui::Rect, pixels_per_point: f32) -> CircleMeterGeometry {
+    let pixels_per_point = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let snap = |value: f32| (value * pixels_per_point).round() / pixels_per_point;
+    let unsnapped_center = rect.center() + egui::vec2(0.0, -4.0);
+
+    CircleMeterGeometry {
+        center: egui::pos2(snap(unsnapped_center.x), snap(unsnapped_center.y)),
+        radius: snap(rect.width().min(rect.height()) * 0.32),
+    }
+}
+
+fn circle_meter_position(
+    geometry: CircleMeterGeometry,
+    index: u8,
+    beats: u8,
+    optical_outset: f32,
+) -> egui::Pos2 {
+    let beats = beats.max(1);
+    let angle = -std::f32::consts::FRAC_PI_2
+        + std::f32::consts::TAU * (f32::from(index) / f32::from(beats));
+    let visual_radius = geometry.radius + optical_outset.max(0.0);
+    geometry.center + egui::vec2(angle.cos(), angle.sin()) * visual_radius
 }
 
 fn paint_accent_ring(
@@ -3298,13 +3350,10 @@ fn paint_circle_subdivision_guides(painter: &egui::Painter, guides: CircleSubdiv
                 } else {
                     0.0
                 };
+            let segment =
+                circle_subdivision_marker_segment(guides.center, guides.radius, angle, extension);
             painter.line_segment(
-                [
-                    guides.center
-                        + egui::vec2(angle.cos(), angle.sin()) * (guides.radius - extension),
-                    guides.center
-                        + egui::vec2(angle.cos(), angle.sin()) * (guides.radius + extension),
-                ],
+                segment,
                 egui::Stroke::new(
                     1.5 + if active {
                         1.5 * guides.style.pulse
@@ -3320,6 +3369,20 @@ fn paint_circle_subdivision_guides(painter: &egui::Painter, guides: CircleSubdiv
             );
         }
     }
+}
+
+fn circle_subdivision_marker_segment(
+    center: egui::Pos2,
+    radius: f32,
+    angle: f32,
+    half_length: f32,
+) -> [egui::Pos2; 2] {
+    let direction = egui::vec2(angle.cos(), angle.sin());
+    let marker_center = center + direction * radius;
+    [
+        marker_center - direction * half_length,
+        marker_center + direction * half_length,
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4830,8 +4893,9 @@ mod tests {
 
     use super::{
         ARC_SWEEP_ANGLE, NORMAL_LAYOUT_MIN_SIZE, ShortcutKeycapKind, SoundKind, arc_endpoint_pop,
-        background_opacity_alpha, compact_layout, cover_uv, format_shortcut, is_compact_size,
-        is_modifier_key, normal_background_blur_sigma, normalize_beat_unit,
+        arc_motion_position, background_opacity_alpha, circle_meter_geometry,
+        circle_meter_position, compact_layout, cover_uv, format_shortcut, is_compact_size,
+        is_modifier_key, normal_background_blur_sigma, normalize_beat_unit, optical_center_offset,
         prepare_background_image, primary_beat_interval_seconds, primary_beat_motion_progress,
         shortcut_keycaps, sound_drop_matches, subdivision_guide_emphasis, unique_preset_name,
     };
@@ -5053,5 +5117,42 @@ mod tests {
         let arrow = shortcut_keycaps("Shift+ArrowUp");
         assert_eq!(arrow[0].kind, ShortcutKeycapKind::Shift);
         assert_eq!(arrow[1].kind, ShortcutKeycapKind::ArrowUp);
+    }
+
+    #[test]
+    fn optical_center_offset_aligns_ink_and_layout_centers() {
+        let layout = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(40.0, 40.0));
+        let ink = egui::Rect::from_min_max(egui::pos2(2.0, 8.0), egui::pos2(38.0, 34.0));
+        assert_eq!(optical_center_offset(layout, ink), -1.0);
+    }
+
+    #[test]
+    fn circle_meter_uses_pixel_aligned_shared_track_geometry() {
+        let rect = egui::Rect::from_min_size(egui::pos2(8.25, 12.75), egui::vec2(503.0, 503.0));
+        let pixels_per_point = 1.25;
+        let geometry = circle_meter_geometry(rect, pixels_per_point);
+
+        assert!((geometry.center.x * pixels_per_point).fract().abs() < f32::EPSILON);
+        assert!((geometry.center.y * pixels_per_point).fract().abs() < f32::EPSILON);
+        assert!((geometry.radius * pixels_per_point).fract().abs() < f32::EPSILON);
+
+        for beat in 0..4 {
+            let position =
+                circle_meter_position(geometry, beat, 4, super::CIRCLE_DOT_OPTICAL_OUTSET);
+            let distance = position.distance(geometry.center);
+            assert!(
+                (distance - (geometry.radius + super::CIRCLE_DOT_OPTICAL_OUTSET)).abs() < 0.001
+            );
+        }
+
+        let visual_radius = geometry.radius + super::CIRCLE_DOT_OPTICAL_OUTSET;
+        let segment = super::circle_subdivision_marker_segment(
+            geometry.center,
+            visual_radius,
+            std::f32::consts::FRAC_PI_4,
+            6.0,
+        );
+        let segment_center = segment[0].lerp(segment[1], 0.5);
+        assert!((segment_center.distance(geometry.center) - visual_radius).abs() < 0.001);
     }
 }
