@@ -1,8 +1,10 @@
 [package]
 name = "metronome-rs"
-version = "1.0.3"
+version = "2.0.0"
 edition = "2024"
 build = "build.rs"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Aodaruma/metronome-rs"
 
 [package.metadata.winresource]
 FileDescription = "metronome-rs desktop metronome"

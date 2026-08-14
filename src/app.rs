@@ -2642,7 +2642,12 @@ impl MetronomeApp {
                         "A cross-platform metronome built with Rust and egui",
                     ));
                     ui.add_space(8.0);
-                    ui.label("MIT License · Copyright © 2026 Aodaruma");
+                    ui.label("GPL-3.0-or-later · Copyright © 2026 Aodaruma");
+                    ui.small(tr(
+                        lang,
+                        "本ソフトウェアは無保証で提供されます。",
+                        "This software is provided without warranty.",
+                    ));
                 });
             self.about_window_open = open;
         }

@@ -24,6 +24,8 @@ The application loads Japanese fonts supplied by the operating system at
 runtime. It does not redistribute those system font files. UI icons are drawn
 procedurally by metronome-rs; no Material Symbols font or SVG file is bundled.
 
-The metronome-rs source itself is distributed under the MIT License. See the
-LICENSE file included beside this notice.
+The metronome-rs source itself, from version 2.0.0 onward, is distributed
+under the GNU General Public License, version 3 or (at your option) any later
+version. Releases through version 1.0.3 were distributed under the MIT
+License. See the LICENSE file included beside this notice.
 

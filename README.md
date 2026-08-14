@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/Aodaruma/metronome-rs/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Aodaruma/metronome-rs/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/Aodaruma/metronome-rs?display_name=tag&sort=semver)](https://github.com/Aodaruma/metronome-rs/releases/latest)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPL--3.0--or--later-blue.svg)](LICENSE)
 [![GitHub Sponsors](https://img.shields.io/github/sponsors/Aodaruma?logo=githubsponsors&label=Sponsor)](https://github.com/sponsors/Aodaruma)
 
 [日本語](#日本語) | [English](#english)
@@ -64,6 +65,8 @@ Building on Linux requires the development packages for ALSA, GTK 3, libxdo, Aya
 
 You can support ongoing development through [GitHub Sponsors](https://github.com/sponsors/Aodaruma).
 
-### License
+### License / ライセンス
 
-Licensed under the MIT License. See [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) for third-party dependency notices.
+metronome-rs v2.0.0以降は、[GNU General Public License v3.0 or later](LICENSE) の下で公開されています。v1.0.3以前のリリースはMIT Licenseで配布されており、既に付与されたライセンスは引き続き有効です。第三者コンポーネントには、それぞれのライセンスが適用されます。詳細は [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) を参照してください。
+
+metronome-rs v2.0.0 and later are licensed under the [GNU General Public License v3.0 or later](LICENSE). Releases up to and including v1.0.3 were distributed under the MIT License; licenses already granted for those releases remain valid. Third-party components remain under their respective licenses; see [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
