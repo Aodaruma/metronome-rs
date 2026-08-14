@@ -17,7 +17,7 @@ use crate::config::{
     OUTPUT_VOLUME_DB_MIN, SWING_AMOUNT_MAX, SWING_AMOUNT_MIN, SoundConfig, SoundSourceId,
     SoundTimingSettings, SwingGrid, ThemeMode, load_config, save_config,
 };
-use crate::fonts::install_application_fonts;
+use crate::fonts::{install_application_fonts, strong_family};
 use crate::menu::{MenuCommand, NativeMenu};
 use crate::platform::{PlatformCommand, PlatformRuntime, set_auto_launch, validate_shortcut};
 use crate::shortcuts::{LocalShortcuts, pressed, validate_local_shortcut};
@@ -44,6 +44,14 @@ const ARC_SWEEP_ANGLE: f32 = std::f32::consts::TAU * 0.75;
 enum AppTab {
     Metronome,
     Preferences,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreferencesCategory {
+    General,
+    Appearance,
+    Sound,
+    Controls,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,6 +140,8 @@ pub struct MetronomeApp {
     force_exit: bool,
     shortcut_capture: Option<ShortcutCaptureTarget>,
     sound_drop_target: Option<SoundKind>,
+    preferences_category: PreferencesCategory,
+    preferences_sound_kind: SoundKind,
 }
 
 impl MetronomeApp {
@@ -189,6 +199,8 @@ impl MetronomeApp {
             force_exit: false,
             shortcut_capture: None,
             sound_drop_target: None,
+            preferences_category: PreferencesCategory::General,
+            preferences_sound_kind: SoundKind::Normal,
         };
         if let Some(path) = app.config.appearance.background_image_path.clone() {
             app.start_background_image_load(path, false);
@@ -1095,7 +1107,7 @@ impl MetronomeApp {
                 if ui.button(tr(lang, "メトロノーム", "Metronome")).clicked() {
                     self.handle_menu_command(MenuCommand::ShowMetronome, ctx);
                 }
-                if ui.button(tr(lang, "環境設定", "Preferences")).clicked() {
+                if ui.button(tr(lang, "設定", "Settings")).clicked() {
                     self.handle_menu_command(MenuCommand::ShowPreferences, ctx);
                 }
                 let mut always_on_top = self.config.appearance.always_on_top;
@@ -1200,7 +1212,7 @@ impl MetronomeApp {
                 ));
                 ui.label(format!(
                     "{}: {}",
-                    tr(lang, "グローバル再生 / 停止", "Global play / pause"),
+                    tr(lang, "グローバル再生 / 一時停止", "Global play / pause"),
                     non_empty_or(&self.config.background.toggle_playback_shortcut, not_set)
                 ));
                 ui.separator();
@@ -1260,7 +1272,7 @@ impl MetronomeApp {
                 preferences_rect,
                 egui::Button::selectable(
                     self.tab == AppTab::Preferences,
-                    tr(lang, "環境設定", "Preferences"),
+                    tr(lang, "設定", "Settings"),
                 ),
             )
             .clicked()
@@ -1372,113 +1384,148 @@ impl MetronomeApp {
 
     fn show_preferences(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(16, 0))
+            .inner_margin(egui::Margin::symmetric(theme::PAGE_PADDING as i8, 0))
             .show(ui, |ui| self.show_preferences_inner(ui, ctx));
     }
 
     fn show_preferences_inner(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let lang = self.language();
-        ui.add_space(8.0);
-        ui.heading(tr(lang, "環境設定", "Preferences"));
-        ui.add_space(12.0);
+        ui.add_space(10.0);
+        ui.columns(4, |columns| {
+            let tabs = [
+                (PreferencesCategory::General, tr(lang, "一般", "General")),
+                (PreferencesCategory::Appearance, tr(lang, "表示", "Display")),
+                (PreferencesCategory::Sound, tr(lang, "音・リズム", "Sound")),
+                (PreferencesCategory::Controls, tr(lang, "操作", "Controls")),
+            ];
+            for (column, (category, label)) in columns.iter_mut().zip(tabs) {
+                let selected = self.preferences_category == category;
+                let width = column.available_width();
+                if column
+                    .add_sized(
+                        [width, theme::SETTINGS_ROW_HEIGHT],
+                        egui::Button::selectable(selected, label),
+                    )
+                    .clicked()
+                {
+                    self.shortcut_capture = None;
+                    self.preferences_category = category;
+                }
+            }
+        });
+        ui.add_space(theme::SECTION_SPACING);
 
         let mut language = self.config.language;
         let mut theme = self.config.theme;
         let mut meter_mode = self.config.meter_mode;
         let mut accent_rgb = self.config.appearance.accent_rgb;
         let mut accent_center_flash = self.config.appearance.accent_center_flash;
-        let mut always_on_top = self.config.appearance.always_on_top;
-        egui::Frame::group(ui.style())
-            .corner_radius(8.0)
-            .inner_margin(12.0)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(tr(lang, "表示", "Appearance")).strong());
-                ui.add_space(6.0);
-                egui::Grid::new("appearance_settings_grid")
-                    .num_columns(2)
-                    .spacing([18.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label(tr(lang, "言語", "Language"));
-                        egui::ComboBox::from_id_salt("settings_language")
-                            .selected_text(language_mode_label(lang, language))
-                            .width(140.0)
-                            .show_ui(ui, |ui| {
-                                for value in [
-                                    LanguageMode::System,
-                                    LanguageMode::Japanese,
-                                    LanguageMode::English,
-                                ] {
-                                    ui.selectable_value(
-                                        &mut language,
-                                        value,
-                                        language_mode_label(lang, value),
-                                    );
-                                }
-                            });
-                        ui.end_row();
+        let preferences_category = self.preferences_category;
+        if matches!(
+            preferences_category,
+            PreferencesCategory::General | PreferencesCategory::Appearance
+        ) {
+            egui::Frame::group(ui.style())
+                .corner_radius(theme::CONTAINER_CORNER_RADIUS)
+                .inner_margin(theme::CARD_PADDING)
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let section_title = if preferences_category == PreferencesCategory::General {
+                        tr(lang, "アプリ", "Application")
+                    } else {
+                        tr(lang, "表示", "Appearance")
+                    };
+                    ui.label(settings_heading(section_title));
+                    ui.add_space(10.0);
+                    egui::Grid::new("appearance_settings_grid")
+                        .num_columns(2)
+                        .spacing([24.0, 12.0])
+                        .show(ui, |ui| {
+                            if preferences_category == PreferencesCategory::General {
+                                ui.label(tr(lang, "言語", "Language"));
+                                egui::ComboBox::from_id_salt("settings_language")
+                                    .selected_text(language_mode_label(lang, language))
+                                    .width(160.0)
+                                    .show_ui(ui, |ui| {
+                                        for value in [
+                                            LanguageMode::System,
+                                            LanguageMode::Japanese,
+                                            LanguageMode::English,
+                                        ] {
+                                            ui.selectable_value(
+                                                &mut language,
+                                                value,
+                                                language_mode_label(lang, value),
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+                            } else {
+                                ui.label(tr(lang, "テーマ", "Theme"));
+                                egui::ComboBox::from_id_salt("settings_theme")
+                                    .selected_text(theme_label(lang, theme))
+                                    .width(160.0)
+                                    .show_ui(ui, |ui| {
+                                        for value in
+                                            [ThemeMode::System, ThemeMode::Dark, ThemeMode::Light]
+                                        {
+                                            ui.selectable_value(
+                                                &mut theme,
+                                                value,
+                                                theme_label(lang, value),
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
 
-                        ui.label(tr(lang, "テーマ", "Theme"));
-                        egui::ComboBox::from_id_salt("settings_theme")
-                            .selected_text(theme_label(lang, theme))
-                            .width(140.0)
-                            .show_ui(ui, |ui| {
-                                for value in [ThemeMode::System, ThemeMode::Dark, ThemeMode::Light]
-                                {
-                                    ui.selectable_value(
-                                        &mut theme,
-                                        value,
-                                        theme_label(lang, value),
-                                    );
-                                }
-                            });
-                        ui.end_row();
-
-                        ui.label(tr(lang, "表示モード", "Meter mode"));
-                        egui::ComboBox::from_id_salt("settings_meter_mode")
-                            .selected_text(meter_mode_label(lang, meter_mode))
-                            .width(140.0)
-                            .show_ui(ui, |ui| {
-                                for value in [MeterMode::Arc, MeterMode::Circle] {
-                                    ui.selectable_value(
-                                        &mut meter_mode,
-                                        value,
-                                        meter_mode_label(lang, value),
-                                    );
-                                }
-                            });
-                        ui.end_row();
-
-                        ui.label(tr(lang, "ウィンドウ", "Window"));
-                        ui.checkbox(&mut always_on_top, tr(lang, "常に最前面", "Always on top"));
-                        ui.end_row();
-                    });
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(6.0);
-                show_accent_color_editor(ui, lang, &mut accent_rgb);
-                ui.checkbox(
-                    &mut accent_center_flash,
-                    tr(
-                        lang,
-                        "アクセント拍で中央をカラー表示",
-                        "Flash the center on accent beats",
-                    ),
-                )
-                .on_hover_text(tr(
-                    lang,
-                    "中央の円がアクセントカラーから徐々に通常色へ戻ります。",
-                    "The center fades from the accent color back to its normal color.",
-                ));
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(6.0);
-                self.show_background_image_editor(ui, lang);
-            });
+                                ui.label(tr(lang, "メーターの形", "Meter shape"));
+                                egui::ComboBox::from_id_salt("settings_meter_mode")
+                                    .selected_text(meter_mode_label(lang, meter_mode))
+                                    .width(160.0)
+                                    .show_ui(ui, |ui| {
+                                        for value in [MeterMode::Arc, MeterMode::Circle] {
+                                            ui.selectable_value(
+                                                &mut meter_mode,
+                                                value,
+                                                meter_mode_label(lang, value),
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+                            }
+                        });
+                    if preferences_category == PreferencesCategory::Appearance {
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        show_accent_color_editor(ui, lang, &mut accent_rgb);
+                        ui.checkbox(
+                            &mut accent_center_flash,
+                            tr(
+                                lang,
+                                "アクセント拍で中央をカラー表示",
+                                "Flash the center on accent beats",
+                            ),
+                        )
+                        .on_hover_text(tr(
+                            lang,
+                            "中央の円がアクセントカラーから徐々に通常色へ戻ります。",
+                            "The center fades from the accent color back to its normal color.",
+                        ));
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+                        self.show_background_image_editor(ui, lang);
+                    }
+                });
+        }
+        if preferences_category == PreferencesCategory::General {
+            ui.add_space(theme::SECTION_SPACING);
+            self.show_runtime_and_shortcut_preferences(ui, ctx, lang, true);
+        }
         self.set_language(language);
         self.set_theme(ctx, theme);
         self.set_meter_mode(meter_mode);
-        self.set_always_on_top(ctx, always_on_top);
         self.set_accent_color(ctx, accent_rgb);
         if self.config.appearance.accent_center_flash != accent_center_flash {
             self.config.appearance.accent_center_flash = accent_center_flash;
@@ -1486,24 +1533,24 @@ impl MetronomeApp {
         }
 
         let lang = self.language();
-        ui.add_space(10.0);
-        let mut normal_volume = i32::from(self.config.sound.normal_volume_percent);
-        let mut accent_volume = i32::from(self.config.sound.accent_volume_percent);
-        let mut subdivision_volume = i32::from(self.config.sound.subdivision_volume_percent);
-        let mut output_volume_db = self.config.audio.output_volume_db;
-        let mut subdivision = self.config.audio.subdivision;
-        let mut swing_grid = self.config.audio.swing.grid;
-        let mut swing_amount = self.config.audio.swing.amount_percent;
-        let mut accent_enabled = self.config.sound.accent_enabled;
-        let mut sound_volume_changed = false;
-        let mut output_volume_changed = false;
-        egui::Frame::group(ui.style())
-            .corner_radius(8.0)
-            .inner_margin(12.0)
+        if self.preferences_category == PreferencesCategory::Sound {
+            let mut normal_volume = i32::from(self.config.sound.normal_volume_percent);
+            let mut accent_volume = i32::from(self.config.sound.accent_volume_percent);
+            let mut subdivision_volume = i32::from(self.config.sound.subdivision_volume_percent);
+            let mut output_volume_db = self.config.audio.output_volume_db;
+            let mut subdivision = self.config.audio.subdivision;
+            let mut swing_grid = self.config.audio.swing.grid;
+            let mut swing_amount = self.config.audio.swing.amount_percent;
+            let mut accent_enabled = self.config.sound.accent_enabled;
+            let mut sound_volume_changed = false;
+            let mut output_volume_changed = false;
+            egui::Frame::group(ui.style())
+            .corner_radius(theme::CONTAINER_CORNER_RADIUS)
+            .inner_margin(theme::CARD_PADDING)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(tr(lang, "サウンド", "Sound")).strong());
-                ui.add_space(6.0);
+                ui.label(settings_heading(tr(lang, "音・リズム", "Sound & rhythm")));
+                ui.add_space(10.0);
                 output_volume_changed = ui
                     .add(
                         egui::Slider::new(
@@ -1526,8 +1573,8 @@ impl MetronomeApp {
                         "Adjusts from mute at −∞ dB up to +12 dB.",
                     ))
                     .changed();
-                ui.add_space(8.0);
-                ui.label(egui::RichText::new(tr(lang, "クリック音", "Click sounds")).strong());
+                ui.add_space(12.0);
+                ui.label(settings_heading(tr(lang, "クリック音", "Click sounds")));
                 ui.checkbox(
                     &mut accent_enabled,
                     tr(
@@ -1536,31 +1583,51 @@ impl MetronomeApp {
                         "Use an accent sound at the start of each bar",
                     ),
                 );
-                ui.add_space(8.0);
-                sound_volume_changed |= self.show_sound_section(
-                    ui,
-                    lang,
-                    SoundKind::Normal,
-                    &mut normal_volume,
-                );
                 ui.add_space(10.0);
-                sound_volume_changed |= self.show_sound_section(
-                    ui,
-                    lang,
-                    SoundKind::Accent,
-                    &mut accent_volume,
-                );
-                ui.add_space(10.0);
-                sound_volume_changed |= self.show_sound_section(
-                    ui,
-                    lang,
-                    SoundKind::Subdivision,
-                    &mut subdivision_volume,
-                );
+                ui.columns(3, |columns| {
+                    for (column, kind) in columns.iter_mut().zip([
+                        SoundKind::Normal,
+                        SoundKind::Accent,
+                        SoundKind::Subdivision,
+                    ]) {
+                        let selected = self.preferences_sound_kind == kind;
+                        if column
+                            .add_sized(
+                                [column.available_width(), theme::SETTINGS_ROW_HEIGHT],
+                                egui::Button::selectable(selected, sound_kind_label(lang, kind)),
+                            )
+                            .clicked()
+                        {
+                            self.preferences_sound_kind = kind;
+                        }
+                    }
+                });
                 ui.add_space(8.0);
+                sound_volume_changed |= match self.preferences_sound_kind {
+                    SoundKind::Normal => self.show_sound_section(
+                        ui,
+                        lang,
+                        SoundKind::Normal,
+                        &mut normal_volume,
+                    ),
+                    SoundKind::Accent => self.show_sound_section(
+                        ui,
+                        lang,
+                        SoundKind::Accent,
+                        &mut accent_volume,
+                    ),
+                    SoundKind::Subdivision => self.show_sound_section(
+                        ui,
+                        lang,
+                        SoundKind::Subdivision,
+                        &mut subdivision_volume,
+                    ),
+                };
+                ui.add_space(12.0);
                 ui.separator();
+                ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    ui.label(tr(lang, "Subdivision", "Subdivision"));
+                    ui.label(tr(lang, "拍の分割", "Beat subdivision"));
                     egui::ComboBox::from_id_salt("settings_subdivision")
                         .selected_text(subdivision_label(lang, subdivision))
                         .width(120.0)
@@ -1574,7 +1641,7 @@ impl MetronomeApp {
                             }
                         });
                 });
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label(tr(lang, "スイング単位", "Swing grid"));
                     egui::ComboBox::from_id_salt("settings_swing_grid")
@@ -1599,38 +1666,38 @@ impl MetronomeApp {
                     "0% is straight; −100% overlaps the previous beat and +100% overlaps the next. Pairs restart each bar.",
                 ));
             });
-        if sound_volume_changed {
-            self.set_sound_volumes(
-                normal_volume as u8,
-                accent_volume as u8,
-                subdivision_volume as u8,
-            );
-        }
-        if output_volume_changed {
-            self.set_output_volume_db(output_volume_db);
-        }
-        if subdivision != self.config.audio.subdivision {
-            self.set_subdivision(subdivision);
-        }
-        if swing_grid != self.config.audio.swing.grid
-            || swing_amount != self.config.audio.swing.amount_percent
-        {
-            self.set_swing(swing_grid, swing_amount);
-        }
-        if accent_enabled != self.config.sound.accent_enabled {
-            self.set_accent_enabled(accent_enabled);
+            if sound_volume_changed {
+                self.set_sound_volumes(
+                    normal_volume as u8,
+                    accent_volume as u8,
+                    subdivision_volume as u8,
+                );
+            }
+            if output_volume_changed {
+                self.set_output_volume_db(output_volume_db);
+            }
+            if subdivision != self.config.audio.subdivision {
+                self.set_subdivision(subdivision);
+            }
+            if swing_grid != self.config.audio.swing.grid
+                || swing_amount != self.config.audio.swing.amount_percent
+            {
+                self.set_swing(swing_grid, swing_amount);
+            }
+            if accent_enabled != self.config.sound.accent_enabled {
+                self.set_accent_enabled(accent_enabled);
+            }
         }
 
-        ui.add_space(10.0);
-        self.show_control_sensitivity_preferences(ui, lang);
-
-        ui.add_space(10.0);
-        self.show_background_preferences(ui, lang);
-
-        ui.add_space(10.0);
-        egui::CollapsingHeader::new(tr(lang, "診断", "Diagnostics"))
-            .default_open(false)
-            .show(ui, |ui| self.show_diagnostics(ui, lang));
+        if self.preferences_category == PreferencesCategory::Controls {
+            self.show_control_sensitivity_preferences(ui, lang);
+            ui.add_space(theme::SECTION_SPACING);
+            self.show_runtime_and_shortcut_preferences(ui, ctx, lang, false);
+            ui.add_space(12.0);
+            egui::CollapsingHeader::new(tr(lang, "診断", "Diagnostics"))
+                .default_open(false)
+                .show(ui, |ui| self.show_diagnostics(ui, lang));
+        }
     }
 
     fn show_control_sensitivity_preferences(&mut self, ui: &mut egui::Ui, lang: Language) {
@@ -1639,11 +1706,15 @@ impl MetronomeApp {
             self.config.interaction.time_signature_drag_sensitivity;
 
         egui::Frame::group(ui.style())
-            .corner_radius(8.0)
-            .inner_margin(12.0)
+            .corner_radius(theme::CONTAINER_CORNER_RADIUS)
+            .inner_margin(theme::CARD_PADDING)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(tr(lang, "操作感度", "Control sensitivity")).strong());
+                ui.label(settings_heading(tr(
+                    lang,
+                    "ドラッグ時の変化量",
+                    "Drag sensitivity",
+                )));
                 ui.add_space(6.0);
                 ui.add(
                     egui::Slider::new(
@@ -1652,7 +1723,7 @@ impl MetronomeApp {
                     )
                     .step_by(0.01)
                     .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
-                    .text(tr(lang, "BPMドラッグ", "BPM drag")),
+                    .text("BPM"),
                 );
                 ui.add(
                     egui::Slider::new(
@@ -1661,7 +1732,7 @@ impl MetronomeApp {
                     )
                     .step_by(0.01)
                     .custom_formatter(|value, _| format!("{:.0}%", value * 100.0))
-                    .text(tr(lang, "拍子ドラッグ", "Time-signature drag")),
+                    .text(tr(lang, "拍子", "Time signature")),
                 );
             });
 
@@ -1679,7 +1750,7 @@ impl MetronomeApp {
 
     fn show_background_image_editor(&mut self, ui: &mut egui::Ui, lang: Language) {
         let loading = self.pending_background_load.is_some();
-        ui.label(egui::RichText::new(tr(lang, "背景画像", "Background image")).strong());
+        ui.label(settings_heading(tr(lang, "背景画像", "Background image")));
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -1740,54 +1811,67 @@ impl MetronomeApp {
             });
         }
 
-        let controls_enabled = self.background_image.is_some() && !loading;
-        let mut opacity = self.config.appearance.background_image_opacity_percent;
-        let mut blur = self.config.appearance.background_image_blur_percent;
-        let opacity_response = ui.add_enabled(
-            controls_enabled,
-            egui::Slider::new(&mut opacity, 0..=100)
-                .suffix(" %")
-                .text(tr(lang, "通常画面の不透明度", "Metronome opacity")),
-        );
-        let blur_response = ui
-            .add_enabled(
-                controls_enabled && self.pending_background_blur.is_none(),
-                egui::Slider::new(&mut blur, 0..=100).suffix(" %").text(tr(
+        if self.background_image.is_some() {
+            let controls_enabled = !loading;
+            let mut opacity = self.config.appearance.background_image_opacity_percent;
+            let mut blur = self.config.appearance.background_image_blur_percent;
+            ui.add_space(8.0);
+            let opacity_response = ui.add_enabled(
+                controls_enabled,
+                egui::Slider::new(&mut opacity, 0..=100)
+                    .suffix(" %")
+                    .text(tr(lang, "通常画面の不透明度", "Metronome opacity")),
+            );
+            let blur_response = ui
+                .add_enabled(
+                    controls_enabled && self.pending_background_blur.is_none(),
+                    egui::Slider::new(&mut blur, 0..=100).suffix(" %").text(tr(
+                        lang,
+                        "通常画面のぼかし",
+                        "Metronome blur",
+                    )),
+                )
+                .on_hover_text(tr(
                     lang,
-                    "通常画面のぼかし",
-                    "Metronome blur",
-                )),
-            )
-            .on_hover_text(tr(
-                lang,
-                "0%でぼかしなし。ドラッグを離した時に適用します。",
-                "0% disables blur. Changes are applied when you release the slider.",
-            ));
-        let opacity_changed = opacity_response.changed();
-        let blur_changed = blur_response.changed();
-        let apply_blur = blur_response.drag_stopped() || (blur_changed && !blur_response.dragged());
-        if opacity_changed || blur_changed {
-            self.config.appearance.background_image_opacity_percent = opacity;
-            self.config.appearance.background_image_blur_percent = blur;
-            self.persist_config();
+                    "0%でぼかしなし。ドラッグを離した時に適用します。",
+                    "0% disables blur. Changes are applied when you release the slider.",
+                ));
+            let opacity_changed = opacity_response.changed();
+            let blur_changed = blur_response.changed();
+            let apply_blur =
+                blur_response.drag_stopped() || (blur_changed && !blur_response.dragged());
+            if opacity_changed || blur_changed {
+                self.config.appearance.background_image_opacity_percent = opacity;
+                self.config.appearance.background_image_blur_percent = blur;
+                self.persist_config();
+            }
+            if apply_blur {
+                self.start_background_blur_update();
+            }
         }
-        if apply_blur {
-            self.start_background_blur_update();
+        if self.background_image.is_some() {
+            ui.label(
+                egui::RichText::new(tr(
+                    lang,
+                    "画像は中央基準で画面全体を覆います。",
+                    "The image is centered and cropped to cover the window.",
+                ))
+                .small()
+                .weak(),
+            );
         }
-        ui.label(
-            egui::RichText::new(tr(
-                lang,
-                "中央基準で画面全体を覆います。環境設定では通常画面の設定とは別に、薄くぼかして表示します。",
-                "Centered and cropped to cover the window. Preferences uses its own softened, dimmed presentation.",
-            ))
-            .small()
-            .weak(),
-        );
     }
 
-    fn show_background_preferences(&mut self, ui: &mut egui::Ui, lang: Language) {
+    fn show_runtime_and_shortcut_preferences(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        lang: Language,
+        show_window_settings: bool,
+    ) {
         let mut close_behavior = self.config.background.close_behavior;
         let mut launch_at_startup = self.config.background.launch_at_startup;
+        let mut always_on_top = self.config.appearance.always_on_top;
         let mut window_shortcut = self.config.background.toggle_window_shortcut.clone();
         let mut playback_shortcut = self.config.background.toggle_playback_shortcut.clone();
         let mut local_playback = self.config.shortcuts.toggle_playback.clone();
@@ -1813,55 +1897,56 @@ impl MetronomeApp {
         }
 
         egui::Frame::group(ui.style())
-            .corner_radius(8.0)
-            .inner_margin(12.0)
+            .corner_radius(theme::CONTAINER_CORNER_RADIUS)
+            .inner_margin(theme::CARD_PADDING)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(
-                    egui::RichText::new(tr(
-                        lang,
-                        "操作とバックグラウンド",
-                        "Controls and background",
-                    ))
-                    .strong(),
-                );
+                ui.label(settings_heading(if show_window_settings {
+                    tr(lang, "ウィンドウと起動", "Window & startup")
+                } else {
+                    tr(lang, "ショートカット", "Shortcuts")
+                }));
                 ui.add_space(6.0);
-                egui::Grid::new("background_settings_grid")
-                    .num_columns(2)
-                    .spacing([18.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label(tr(lang, "閉じるボタン", "Close button"));
-                        egui::ComboBox::from_id_salt("close_behavior")
-                            .selected_text(close_behavior_label(lang, close_behavior))
-                            .width(200.0)
-                            .show_ui(ui, |ui| {
-                                for value in [CloseBehavior::Exit, CloseBehavior::KeepRunning] {
-                                    ui.selectable_value(
-                                        &mut close_behavior,
-                                        value,
-                                        close_behavior_label(lang, value),
-                                    );
-                                }
-                            });
-                        ui.end_row();
-
-                        ui.label(tr(lang, "PC起動時", "At login"));
-                        ui.add_enabled_ui(close_behavior.keeps_running(), |ui| {
+                if show_window_settings {
+                    egui::Grid::new("background_settings_grid")
+                        .num_columns(2)
+                        .spacing([18.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(tr(lang, "ウィンドウ", "Window"));
                             ui.checkbox(
-                                &mut launch_at_startup,
-                                tr(lang, "バックグラウンドで起動", "Start in background"),
+                                &mut always_on_top,
+                                tr(lang, "常に最前面", "Always on top"),
                             );
-                        });
-                        ui.end_row();
-                    });
+                            ui.end_row();
 
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(tr(lang, "アプリ内ショートカット", "In-app shortcuts"))
-                        .strong(),
-                );
+                            ui.label(tr(lang, "閉じるボタン", "Close button"));
+                            egui::ComboBox::from_id_salt("close_behavior")
+                                .selected_text(close_behavior_label(lang, close_behavior))
+                                .width(200.0)
+                                .show_ui(ui, |ui| {
+                                    for value in [CloseBehavior::Exit, CloseBehavior::KeepRunning] {
+                                        ui.selectable_value(
+                                            &mut close_behavior,
+                                            value,
+                                            close_behavior_label(lang, value),
+                                        );
+                                    }
+                                });
+                            ui.end_row();
+
+                            ui.label(tr(lang, "PC起動時", "At login"));
+                            ui.add_enabled_ui(close_behavior.keeps_running(), |ui| {
+                                ui.checkbox(
+                                    &mut launch_at_startup,
+                                    tr(lang, "バックグラウンドで起動", "Start in background"),
+                                );
+                            });
+                            ui.end_row();
+                        });
+                    return;
+                }
+
+                ui.label(settings_heading(tr(lang, "アプリ内", "In-app")));
                 ui.label(
                     egui::RichText::new(tr(
                         lang,
@@ -1875,7 +1960,7 @@ impl MetronomeApp {
                     .num_columns(2)
                     .spacing([18.0, 8.0])
                     .show(ui, |ui| {
-                        ui.label(tr(lang, "再生 / 停止", "Play / pause"));
+                        ui.label(tr(lang, "再生 / 一時停止", "Play / pause"));
                         if shortcut_capture_button(
                             ui,
                             lang,
@@ -1953,22 +2038,10 @@ impl MetronomeApp {
                     ui.colored_label(ui.visuals().error_fg_color, error);
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 ui.separator();
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(tr(lang, "グローバルショートカット", "Global shortcuts"))
-                        .strong(),
-                );
-                ui.label(
-                    egui::RichText::new(tr(
-                        lang,
-                        "ボタンを選択してキーを入力（Escで解除）",
-                        "Select a button and press a key (Esc to clear)",
-                    ))
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
-                );
+                ui.add_space(10.0);
+                ui.label(settings_heading(tr(lang, "グローバル", "Global")));
                 ui.add_enabled_ui(close_behavior.keeps_running(), |ui| {
                     egui::Grid::new("global_shortcut_grid")
                         .num_columns(2)
@@ -1985,7 +2058,7 @@ impl MetronomeApp {
                                 self.shortcut_capture = Some(ShortcutCaptureTarget::GlobalWindow);
                             }
                             ui.end_row();
-                            ui.label(tr(lang, "再生 / 停止", "Play / pause"));
+                            ui.label(tr(lang, "再生 / 一時停止", "Play / pause"));
                             if shortcut_capture_button(
                                 ui,
                                 lang,
@@ -2054,6 +2127,7 @@ impl MetronomeApp {
         if behavior_changed || shortcuts_changed || local_shortcuts_changed {
             self.persist_config();
         }
+        self.set_always_on_top(ctx, always_on_top);
         if auto_launch_error.is_some() {
             self.platform_error = auto_launch_error;
         }
@@ -2068,12 +2142,10 @@ impl MetronomeApp {
     ) -> bool {
         let mut volume_changed = false;
         let card = egui::Frame::group(ui.style())
-            .corner_radius(8.0)
-            .inner_margin(10.0)
+            .corner_radius(theme::CONTAINER_CORNER_RADIUS)
+            .inner_margin(theme::CARD_PADDING)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(sound_kind_label(lang, kind)).strong());
-                ui.add_space(6.0);
                 self.show_sound_file_row(ui, lang, kind);
                 ui.add_space(8.0);
                 volume_changed |= ui
@@ -2083,20 +2155,22 @@ impl MetronomeApp {
                         "Volume (%)",
                     )))
                     .changed();
-                ui.add_space(8.0);
-                ui.separator();
                 ui.add_space(4.0);
-                self.show_sound_timing_controls(ui, lang, kind);
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(tr(
-                        lang,
-                        "WAV / FLAC / MP3 / OGGをここへドロップ",
-                        "Drop a WAV / FLAC / MP3 / OGG file here",
-                    ))
-                    .small()
-                    .weak(),
-                );
+                egui::CollapsingHeader::new(tr(lang, "詳細設定", "Advanced"))
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        self.show_sound_timing_controls(ui, lang, kind);
+                        ui.add_space(6.0);
+                        ui.label(
+                            egui::RichText::new(tr(
+                                lang,
+                                "WAV / FLAC / MP3 / OGGをこの枠内へドロップ",
+                                "Drop a WAV / FLAC / MP3 / OGG file in this panel",
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    });
             });
 
         let (has_hovered_files, has_dropped_files, pointer_pos, dropped_path) =
@@ -2118,7 +2192,7 @@ impl MetronomeApp {
             self.sound_drop_target = Some(kind);
             ui.painter().rect_stroke(
                 card.response.rect,
-                8.0,
+                theme::CONTAINER_CORNER_RADIUS,
                 egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
                 egui::StrokeKind::Inside,
             );
@@ -3529,6 +3603,10 @@ fn shortcut_capture_button(
         .clicked()
 }
 
+fn settings_heading(text: &str) -> egui::RichText {
+    egui::RichText::new(text).family(strong_family()).strong()
+}
+
 fn captured_shortcut(ctx: &egui::Context) -> Option<String> {
     ctx.input(|input| {
         input.events.iter().find_map(|event| match event {
@@ -4277,7 +4355,7 @@ fn sound_kind_label(lang: Language, kind: SoundKind) -> &'static str {
     match kind {
         SoundKind::Normal => tr(lang, "通常音", "Normal"),
         SoundKind::Accent => tr(lang, "アクセント", "Accent"),
-        SoundKind::Subdivision => "Subdivision",
+        SoundKind::Subdivision => tr(lang, "分割音", "Subdivision"),
     }
 }
 
