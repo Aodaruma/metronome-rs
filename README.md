@@ -7,7 +7,11 @@
 
 [日本語](#日本語) | [English](#english)
 
-![metronome-rs application preview](docs/images/metronome-preview.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/metronome-preview-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/metronome-preview.png">
+  <img alt="metronome-rs application preview" src="docs/images/metronome-preview.png" width="520">
+</picture>
 
 ## 日本語
 
