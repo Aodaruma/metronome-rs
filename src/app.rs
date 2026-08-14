@@ -17,7 +17,7 @@ use crate::config::{
     OUTPUT_VOLUME_DB_MIN, SWING_AMOUNT_MAX, SWING_AMOUNT_MIN, SoundConfig, SoundSourceId,
     SoundTimingSettings, SwingGrid, ThemeMode, load_config, save_config,
 };
-use crate::fonts::{install_application_fonts, strong_family};
+use crate::fonts::{install_application_fonts, regular_family, strong_family};
 use crate::menu::{MenuCommand, NativeMenu};
 use crate::platform::{PlatformCommand, PlatformRuntime, set_auto_launch, validate_shortcut};
 use crate::shortcuts::{LocalShortcuts, pressed, validate_local_shortcut};
@@ -347,13 +347,23 @@ impl MetronomeApp {
             }
             MenuCommand::SavePreset => self.save_current_preset(),
             MenuCommand::ShowPresets => {
+                self.shortcut_capture = None;
                 self.tab = AppTab::Metronome;
                 self.set_presets_sidebar_open(ctx, true);
             }
-            MenuCommand::ShowMetronome => self.tab = AppTab::Metronome,
+            MenuCommand::ShowMetronome => {
+                self.shortcut_capture = None;
+                self.tab = AppTab::Metronome;
+            }
             MenuCommand::ShowPreferences => {
                 self.set_presets_sidebar_open(ctx, false);
                 self.ensure_normal_window_size(ctx);
+                self.tab = AppTab::Preferences;
+            }
+            MenuCommand::ShowShortcutSettings => {
+                self.set_presets_sidebar_open(ctx, false);
+                self.ensure_normal_window_size(ctx);
+                self.preferences_category = PreferencesCategory::Controls;
                 self.tab = AppTab::Preferences;
             }
             MenuCommand::ToggleAlwaysOnTop => {
@@ -1220,7 +1230,7 @@ impl MetronomeApp {
                     .button(tr(lang, "ショートカット設定…", "Shortcut settings…"))
                     .clicked()
                 {
-                    self.handle_menu_command(MenuCommand::ShowPreferences, ctx);
+                    self.handle_menu_command(MenuCommand::ShowShortcutSettings, ctx);
                 }
             });
             ui.menu_button(tr(lang, "ヘルプ", "Help"), |ui| {
@@ -1265,6 +1275,7 @@ impl MetronomeApp {
             )
             .clicked()
         {
+            self.shortcut_capture = None;
             self.tab = AppTab::Metronome;
         }
         if ui
@@ -3590,17 +3601,390 @@ fn shortcut_capture_button(
     shortcut: &str,
 ) -> bool {
     let active = active_target == Some(target);
-    let label = if active {
-        tr(
-            lang,
-            "キーを入力…（Escで解除）",
-            "Press keys… (Esc to clear)",
-        )
+    let desired_size = egui::vec2(190.0, 34.0);
+    let (rect, response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    let widget_visuals = if active {
+        &ui.visuals().widgets.active
     } else {
-        non_empty_or(shortcut, tr(lang, "未設定", "Not set"))
+        ui.style().interact(&response)
     };
-    ui.add_sized([220.0, 28.0], egui::Button::selectable(active, label))
+    ui.painter().rect(
+        rect,
+        theme::CONTROL_CORNER_RADIUS,
+        widget_visuals.weak_bg_fill,
+        widget_visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+
+    if active {
+        paint_shortcut_recording_prompt(ui, rect, lang);
+    } else if shortcut.trim().is_empty() {
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            tr(lang, "クリックして登録", "Click to record"),
+            egui::FontId::new(12.0, regular_family()),
+            ui.visuals().weak_text_color(),
+        );
+    } else {
+        paint_shortcut_keycaps(ui, rect, shortcut);
+    }
+
+    response
+        .on_hover_text(tr(
+            lang,
+            "クリック後にショートカットを入力します。Escで登録を解除します。",
+            "Click, then press a shortcut. Press Esc to clear the binding.",
+        ))
         .clicked()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShortcutKeycap {
+    kind: ShortcutKeycapKind,
+    label: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShortcutKeycapKind {
+    Text,
+    Control,
+    Alt,
+    Shift,
+    #[cfg(target_os = "macos")]
+    Command,
+    Super,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    Backspace,
+}
+
+fn shortcut_keycaps(shortcut: &str) -> Vec<ShortcutKeycap> {
+    shortcut
+        .split('+')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            let normalized = token.to_ascii_lowercase();
+            let kind = match normalized.as_str() {
+                "ctrl" | "control" => ShortcutKeycapKind::Control,
+                "alt" | "option" => ShortcutKeycapKind::Alt,
+                "shift" => ShortcutKeycapKind::Shift,
+                "cmd" | "command" => command_keycap_kind(),
+                "cmdorctrl" | "commandorcontrol" => command_or_control_keycap_kind(),
+                "super" | "meta" | "win" | "windows" => ShortcutKeycapKind::Super,
+                "arrowup" => ShortcutKeycapKind::ArrowUp,
+                "arrowdown" => ShortcutKeycapKind::ArrowDown,
+                "arrowleft" => ShortcutKeycapKind::ArrowLeft,
+                "arrowright" => ShortcutKeycapKind::ArrowRight,
+                "backspace" => ShortcutKeycapKind::Backspace,
+                _ => ShortcutKeycapKind::Text,
+            };
+            ShortcutKeycap {
+                kind,
+                label: shortcut_key_label(token).to_owned(),
+            }
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn command_keycap_kind() -> ShortcutKeycapKind {
+    ShortcutKeycapKind::Command
+}
+
+#[cfg(not(target_os = "macos"))]
+fn command_keycap_kind() -> ShortcutKeycapKind {
+    ShortcutKeycapKind::Super
+}
+
+#[cfg(target_os = "macos")]
+fn command_or_control_keycap_kind() -> ShortcutKeycapKind {
+    ShortcutKeycapKind::Command
+}
+
+#[cfg(not(target_os = "macos"))]
+fn command_or_control_keycap_kind() -> ShortcutKeycapKind {
+    ShortcutKeycapKind::Control
+}
+
+fn shortcut_key_label(token: &str) -> &str {
+    match token.to_ascii_lowercase().as_str() {
+        "space" => "Space",
+        "escape" | "esc" => "Esc",
+        "delete" => "Del",
+        "enter" => "Enter",
+        "tab" => "Tab",
+        _ => token,
+    }
+}
+
+fn paint_shortcut_recording_prompt(ui: &egui::Ui, rect: egui::Rect, lang: Language) {
+    let accent = ui.visuals().selection.bg_fill;
+    let text = tr(lang, "キーを入力…", "Press shortcut…");
+    let font_id = egui::FontId::new(12.0, regular_family());
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), font_id.clone(), ui.visuals().text_color());
+    let content_width = 8.0 + 6.0 + galley.size().x;
+    let start_x = rect.center().x - content_width * 0.5;
+    ui.painter()
+        .circle_filled(egui::pos2(start_x + 4.0, rect.center().y), 4.0, accent);
+    ui.painter().galley(
+        egui::pos2(start_x + 14.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        ui.visuals().text_color(),
+    );
+}
+
+fn paint_shortcut_keycaps(ui: &egui::Ui, rect: egui::Rect, shortcut: &str) {
+    let keycaps = shortcut_keycaps(shortcut);
+    let gap = 4.0;
+    let widths = keycaps
+        .iter()
+        .map(shortcut_keycap_width)
+        .collect::<Vec<_>>();
+    let total_width = widths.iter().sum::<f32>() + gap * keycaps.len().saturating_sub(1) as f32;
+    let mut x = rect.center().x - total_width * 0.5;
+    let height = 24.0;
+    let text_color = ui.visuals().text_color();
+    let keycap_fill = ui.visuals().extreme_bg_color;
+    let keycap_stroke = ui.visuals().widgets.inactive.bg_stroke;
+
+    for (keycap, width) in keycaps.iter().zip(widths) {
+        let keycap_rect = egui::Rect::from_min_size(
+            egui::pos2(x, rect.center().y - height * 0.5),
+            egui::vec2(width, height),
+        );
+        ui.painter().rect(
+            keycap_rect,
+            5.0,
+            keycap_fill,
+            keycap_stroke,
+            egui::StrokeKind::Inside,
+        );
+        if keycap.kind == ShortcutKeycapKind::Text {
+            ui.painter().text(
+                keycap_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                &keycap.label,
+                egui::FontId::new(12.0, regular_family()),
+                text_color,
+            );
+        } else {
+            paint_shortcut_modifier_icon(
+                ui.painter(),
+                keycap_rect.center(),
+                keycap.kind,
+                text_color,
+            );
+        }
+        x += width + gap;
+    }
+}
+
+fn shortcut_keycap_width(keycap: &ShortcutKeycap) -> f32 {
+    if keycap.kind == ShortcutKeycapKind::Text {
+        (keycap.label.chars().count() as f32 * 7.2 + 14.0).clamp(28.0, 84.0)
+    } else {
+        26.0
+    }
+}
+
+fn paint_shortcut_modifier_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    kind: ShortcutKeycapKind,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.5, color);
+    match kind {
+        ShortcutKeycapKind::Control => {
+            painter.line_segment(
+                [
+                    center + egui::vec2(-5.0, 2.0),
+                    center + egui::vec2(0.0, -3.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(0.0, -3.0),
+                    center + egui::vec2(5.0, 2.0),
+                ],
+                stroke,
+            );
+        }
+        ShortcutKeycapKind::Alt => paint_alt_modifier_icon(painter, center, stroke),
+        ShortcutKeycapKind::Shift => {
+            let points = vec![
+                center + egui::vec2(-6.0, 0.0),
+                center + egui::vec2(0.0, -6.0),
+                center + egui::vec2(6.0, 0.0),
+                center + egui::vec2(3.0, 0.0),
+                center + egui::vec2(3.0, 6.0),
+                center + egui::vec2(-3.0, 6.0),
+                center + egui::vec2(-3.0, 0.0),
+            ];
+            painter.add(egui::Shape::closed_line(points, stroke));
+        }
+        #[cfg(target_os = "macos")]
+        ShortcutKeycapKind::Command => {
+            for offset in [
+                egui::vec2(-3.0, -3.0),
+                egui::vec2(3.0, -3.0),
+                egui::vec2(-3.0, 3.0),
+                egui::vec2(3.0, 3.0),
+            ] {
+                painter.circle_stroke(center + offset, 3.0, stroke);
+            }
+        }
+        ShortcutKeycapKind::Super => {
+            for offset in [
+                egui::vec2(-3.5, -3.5),
+                egui::vec2(3.5, -3.5),
+                egui::vec2(-3.5, 3.5),
+                egui::vec2(3.5, 3.5),
+            ] {
+                painter.rect_filled(
+                    egui::Rect::from_center_size(center + offset, egui::vec2(5.0, 5.0)),
+                    0.5,
+                    color,
+                );
+            }
+        }
+        ShortcutKeycapKind::ArrowUp => {
+            paint_arrow_icon(painter, center, egui::vec2(0.0, -1.0), stroke);
+        }
+        ShortcutKeycapKind::ArrowDown => {
+            paint_arrow_icon(painter, center, egui::vec2(0.0, 1.0), stroke);
+        }
+        ShortcutKeycapKind::ArrowLeft => {
+            paint_arrow_icon(painter, center, egui::vec2(-1.0, 0.0), stroke);
+        }
+        ShortcutKeycapKind::ArrowRight => {
+            paint_arrow_icon(painter, center, egui::vec2(1.0, 0.0), stroke);
+        }
+        ShortcutKeycapKind::Backspace => {
+            let points = vec![
+                center + egui::vec2(-7.0, 0.0),
+                center + egui::vec2(-3.0, -5.0),
+                center + egui::vec2(7.0, -5.0),
+                center + egui::vec2(7.0, 5.0),
+                center + egui::vec2(-3.0, 5.0),
+            ];
+            painter.add(egui::Shape::closed_line(points, stroke));
+            painter.line_segment(
+                [
+                    center + egui::vec2(-1.0, -2.5),
+                    center + egui::vec2(4.0, 2.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(4.0, -2.5),
+                    center + egui::vec2(-1.0, 2.5),
+                ],
+                stroke,
+            );
+        }
+        ShortcutKeycapKind::Text => {}
+    }
+}
+
+fn paint_arrow_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    direction: egui::Vec2,
+    stroke: egui::Stroke,
+) {
+    let perpendicular = egui::vec2(-direction.y, direction.x);
+    let tip = center + direction * 6.0;
+    let tail = center - direction * 6.0;
+    painter.line_segment([tail, tip], stroke);
+    painter.line_segment([tip, tip - direction * 4.0 + perpendicular * 3.5], stroke);
+    painter.line_segment([tip, tip - direction * 4.0 - perpendicular * 3.5], stroke);
+}
+
+#[cfg(target_os = "macos")]
+fn paint_alt_modifier_icon(painter: &egui::Painter, center: egui::Pos2, stroke: egui::Stroke) {
+    painter.line_segment(
+        [
+            center + egui::vec2(-6.0, -4.0),
+            center + egui::vec2(-2.0, -4.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(-2.0, -4.0),
+            center + egui::vec2(5.0, 5.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(-6.0, 5.0),
+            center + egui::vec2(-2.0, 5.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(2.0, -4.0),
+            center + egui::vec2(6.0, -4.0),
+        ],
+        stroke,
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+fn paint_alt_modifier_icon(painter: &egui::Painter, center: egui::Pos2, stroke: egui::Stroke) {
+    painter.line_segment(
+        [
+            center + egui::vec2(-6.0, -3.0),
+            center + egui::vec2(4.0, -3.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(4.0, -3.0),
+            center + egui::vec2(1.0, -6.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(4.0, -3.0),
+            center + egui::vec2(1.0, 0.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(6.0, 4.0),
+            center + egui::vec2(-4.0, 4.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(-4.0, 4.0),
+            center + egui::vec2(-1.0, 1.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            center + egui::vec2(-4.0, 4.0),
+            center + egui::vec2(-1.0, 7.0),
+        ],
+        stroke,
+    );
 }
 
 fn settings_heading(text: &str) -> egui::RichText {
@@ -4445,11 +4829,11 @@ mod tests {
     use eframe::egui;
 
     use super::{
-        ARC_SWEEP_ANGLE, NORMAL_LAYOUT_MIN_SIZE, SoundKind, arc_endpoint_pop, arc_motion_position,
+        ARC_SWEEP_ANGLE, NORMAL_LAYOUT_MIN_SIZE, ShortcutKeycapKind, SoundKind, arc_endpoint_pop,
         background_opacity_alpha, compact_layout, cover_uv, format_shortcut, is_compact_size,
         is_modifier_key, normal_background_blur_sigma, normalize_beat_unit,
         prepare_background_image, primary_beat_interval_seconds, primary_beat_motion_progress,
-        sound_drop_matches, subdivision_guide_emphasis, unique_preset_name,
+        shortcut_keycaps, sound_drop_matches, subdivision_guide_emphasis, unique_preset_name,
     };
     use crate::config::{BpmPreset, SwingGrid};
 
@@ -4656,5 +5040,18 @@ mod tests {
         assert!(is_modifier_key(egui::Key::ShiftLeft));
         assert!(is_modifier_key(egui::Key::ControlRight));
         assert!(!is_modifier_key(egui::Key::ArrowUp));
+    }
+
+    #[test]
+    fn shortcut_display_separates_modifiers_and_material_style_keys() {
+        let keycaps = shortcut_keycaps("Ctrl+Alt+P");
+        assert_eq!(keycaps[0].kind, ShortcutKeycapKind::Control);
+        assert_eq!(keycaps[1].kind, ShortcutKeycapKind::Alt);
+        assert_eq!(keycaps[2].kind, ShortcutKeycapKind::Text);
+        assert_eq!(keycaps[2].label, "P");
+
+        let arrow = shortcut_keycaps("Shift+ArrowUp");
+        assert_eq!(arrow[0].kind, ShortcutKeycapKind::Shift);
+        assert_eq!(arrow[1].kind, ShortcutKeycapKind::ArrowUp);
     }
 }
