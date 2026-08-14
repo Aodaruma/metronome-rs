@@ -29,6 +29,10 @@ def copy_notices(destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
     for name in ("LICENSE", "THIRD_PARTY_NOTICES"):
         shutil.copy2(name, destination / name)
+    font_licenses = destination / "licenses" / "fonts"
+    font_licenses.mkdir(parents=True, exist_ok=True)
+    for name in ("OFL-JetBrainsMono.txt", "OFL-UDEVGothic.txt"):
+        shutil.copy2(Path("assets") / "fonts" / name, font_licenses / name)
 
 
 def add_zip_tree(archive: zipfile.ZipFile, root: Path) -> None:

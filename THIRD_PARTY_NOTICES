@@ -20,12 +20,23 @@ Principal direct dependencies include:
 - auto-launch: MIT
 - sys-locale: MIT OR Apache-2.0
 
-The application loads Japanese fonts supplied by the operating system at
-runtime. It does not redistribute those system font files. UI icons are drawn
-procedurally by metronome-rs; no Material Symbols font or SVG file is bundled.
+Bundled fonts:
+
+- JetBrains Mono variable font
+  Copyright 2020 The JetBrains Mono Project Authors
+  Licensed under the SIL Open Font License, Version 1.1.
+  See assets/fonts/OFL-JetBrainsMono.txt in the source tree and
+  licenses/fonts/OFL-JetBrainsMono.txt in release packages.
+- UDEV Gothic regular and bold fonts
+  Copyright (c) 2022 Yuko OTAWARA. Reserved Font Name "UDEV Gothic".
+  Licensed under the SIL Open Font License, Version 1.1.
+  See assets/fonts/OFL-UDEVGothic.txt in the source tree and
+  licenses/fonts/OFL-UDEVGothic.txt in release packages.
+
+UI icons are drawn procedurally by metronome-rs; no Material Symbols font or
+SVG file is bundled.
 
 The metronome-rs source itself, from version 2.0.0 onward, is distributed
 under the GNU General Public License, version 3 or (at your option) any later
 version. Releases through version 1.0.3 were distributed under the MIT
 License. See the LICENSE file included beside this notice.
-

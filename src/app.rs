@@ -17,7 +17,7 @@ use crate::config::{
     OUTPUT_VOLUME_DB_MIN, SWING_AMOUNT_MAX, SWING_AMOUNT_MIN, SoundConfig, SoundSourceId,
     SoundTimingSettings, SwingGrid, ThemeMode, load_config, save_config,
 };
-use crate::fonts::install_japanese_font;
+use crate::fonts::install_application_fonts;
 use crate::menu::{MenuCommand, NativeMenu};
 use crate::platform::{PlatformCommand, PlatformRuntime, set_auto_launch, validate_shortcut};
 use crate::shortcuts::{LocalShortcuts, pressed, validate_local_shortcut};
@@ -143,7 +143,7 @@ impl MetronomeApp {
             cc.egui_ctx
                 .send_viewport_cmd(egui::ViewportCommand::Visible(true));
         }
-        install_japanese_font(&cc.egui_ctx);
+        install_application_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, config.theme, config.appearance.accent_rgb);
         apply_window_level(&cc.egui_ctx, config.appearance.always_on_top);
 
